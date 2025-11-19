@@ -1,0 +1,8 @@
+Create environment:
+conda env create -f environment.yml
+
+activate:
+conda activate machine-learning-env
+
+check:
+python src/utils/env_check.py
