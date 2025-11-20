@@ -1,8 +1,11 @@
+#IMPORT
 import polars as pl
 import scipy.io
 from pathlib import Path
 import numpy as np
+import matplotlib.pyplot as plt
 
+#####################################################################
 def get_file_names(folder_path="data"):
     folder = Path(folder_path)
     mat_files = list(folder.glob("*.mat"))
@@ -37,8 +40,8 @@ def read_file(file_path):
       
 
         # Extract channel names
-        channel_names = [str(o_data["chnames"][i][0]) for i in range(o_data["chnames"].shape[0])]
-
+        channel_names = [str(o_data["chnames"][i][0]).replace("[", "").replace("]", "").replace("'", "").strip() for i in range(o_data["chnames"].shape[0])]
+   
         # Create DataFrame - use schema as simple list of names
         df_data = pl.from_numpy(o_data['data'])
         df_data = df_data.rename({f"column_{i}": name for i, name in enumerate(channel_names)})
@@ -53,3 +56,42 @@ def read_file(file_path):
         print(f"Error reading {file_path}: {e}")
         return None, None
 
+
+def plot_eeg_signals(
+    eeg_data,
+    first_sample=0,
+    window_size=None,       
+    freq=200,
+    channels=None           
+):
+    dt = 1 / freq
+    total_samples = eeg_data.height
+
+    if channels is None:
+        channels = eeg_data.columns
+    else:
+        channels = [ch for ch in channels if ch in eeg_data.columns]
+
+    if window_size is None:
+        last_sample = total_samples
+    else:
+        samples_in_window = int(window_size)
+        last_sample = min(first_sample + samples_in_window, total_samples)
+
+    eeg_slice = eeg_data.slice(first_sample, last_sample - first_sample)
+
+    # Time axis
+    N = eeg_slice.height
+    t = np.arange(N) * dt
+
+    # Plot
+    plt.figure(figsize=(12, 6))
+    for ch in channels:
+        y = eeg_slice[ch].to_numpy()
+        plt.plot(t, y, label=ch)
+
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
