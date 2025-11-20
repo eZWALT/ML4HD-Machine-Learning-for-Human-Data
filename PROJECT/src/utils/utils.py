@@ -4,7 +4,7 @@ import scipy.io
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-
+from scipy.signal import welch
 #####################################################################
 def get_file_names(folder_path="data"):
     folder = Path(folder_path)
@@ -68,7 +68,7 @@ def plot_eeg_signals(
     total_samples = eeg_data.height
 
     if channels is None:
-        channels = eeg_data.columns
+        channels = [col for col in eeg_data.columns if col != "marker"]
     else:
         channels = [ch for ch in channels if ch in eeg_data.columns]
 
@@ -95,3 +95,32 @@ def plot_eeg_signals(
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+#A plot that shows: “How much of my EEG signal is present at each frequency?”
+#Useful to identify dominant frequencies, artifacts, and overall spectral characteristics of the EEG data.
+
+def power_spectrum(eeg_data, fs=200):
+    # Select numeric columns (all EEG channels)
+    columns = [col for col in eeg_data.columns if col != "marker"]
+    print("Processing channels:", columns)
+    
+    for col in columns:
+        data = eeg_data[col].to_numpy()
+        
+        # Compute Welch PSD
+        freqs, psd = welch(data, fs=fs, nperseg=1024)
+        
+        # Detect line noise frequency in 40–70 Hz
+        mask = (freqs >= 40) & (freqs <= 70)
+        line_freq = freqs[mask][np.argmax(psd[mask])]
+        
+        print(f"Channel {col} → likely line noise: {line_freq:.2f} Hz")
+        
+        # Plot PSD
+        plt.figure(figsize=(6, 3))
+        plt.semilogy(freqs, psd)
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Power")
+        plt.title(f"Power Spectrum of {col}")
+        plt.tight_layout()
+        plt.show()
