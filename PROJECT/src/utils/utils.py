@@ -3,8 +3,11 @@ import polars as pl
 import scipy.io
 from pathlib import Path
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.signal import welch
+import matplotlib.pyplot as plt
+import mne
+
+
 #####################################################################
 def get_file_names(folder_path="data"):
     folder = Path(folder_path)
@@ -55,7 +58,44 @@ def read_file(file_path):
     except Exception as e:
         print(f"Error reading {file_path}: {e}")
         return None, None
+    
+def read_file_to_raw(file_path, drop_channels=['X5']):
+    try:
+        mat_data = scipy.io.loadmat(file_path)
+        subject_info = ((file_path.split("/")[-1]).split(".")[0]).split("-")
+        o_data = mat_data['o'][0, 0]        
+        sfreq = int(o_data['sampFreq'][0, 0]) if o_data['sampFreq'].size > 0 else 200
+        channel_names = []
+        all_channel_names = []  # Keep track of all original channels
+        for i in range(o_data["chnames"].shape[0]):
+            ch_name = str(o_data["chnames"][i][0]).replace("[", "").replace("]", "").replace("'", "").strip()
+            all_channel_names.append(ch_name)
+            if ch_name not in drop_channels:
+                channel_names.append(ch_name)
+        
+        print(f"Channels: {channel_names}")
 
+        full_data = o_data['data']  
+        keep_indices = [i for i, ch_name in enumerate(all_channel_names) if ch_name not in drop_channels]
+        eeg_data = full_data[:, keep_indices].T  # Shape: (n_channels, n_samples)
+        info = mne.create_info(
+            ch_names=channel_names,
+            sfreq=sfreq,
+            ch_types='eeg'
+        )
+        
+        # Add standard 10-20 montage
+        montage = mne.channels.make_standard_montage('standard_1020')
+        info.set_montage(montage)
+        raw = mne.io.RawArray(eeg_data, info)
+        print("Successfully created Raw object")
+        return raw
+        
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def plot_eeg_signals(
     eeg_data,
@@ -98,6 +138,7 @@ def plot_eeg_signals(
 
 #A plot that shows: “How much of my EEG signal is present at each frequency?”
 #Useful to identify dominant frequencies, artifacts, and overall spectral characteristics of the EEG data.
+#THIS CAN BE DELETED SINCE WE ARE USING RAW NOW
 
 def power_spectrum(eeg_data, fs=200):
     # Select numeric columns (all EEG channels)
