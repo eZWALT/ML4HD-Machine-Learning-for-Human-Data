@@ -1,7 +1,7 @@
 
 """
 Environment verification script.
-Run this after setting up the conda environment to verify all dependencies.
+Run this after setting up the virtual environment to verify all dependencies.
 """
 
 import importlib
