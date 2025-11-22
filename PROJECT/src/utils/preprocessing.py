@@ -1,8 +1,8 @@
-from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import polars as pl
 import numpy as np
 import mne
+from mne import make_fixed_length_events
 #####################################################################
 
 ######## PREPROCESSING ###########
@@ -20,25 +20,26 @@ import mne
 # - This step we wont do it, we will just decide beforehand if we want to use average reference or not. And same for interpolation.
 # After PREP we have to work on the spikes removal and artifact rejection, but this is not part of PREP. We will add this to the general preprocessing pipeline too.
 # For this we will use independent component analysis (ICA) to identify and remove artifacts from the EEG data.
-#ESTO NO FUNCIONA BIEN HAY QUE REVISARLO
+
 def robust_reference(raw, std_z_thresh=3.0, flat_thresh=1e-6):
+    raw = raw.copy()
     picks = mne.pick_types(raw.info, eeg=True, exclude=[])
-    data, _ = raw[picks, :]
+    data = raw.get_data(picks=picks)
     ch_names = [raw.ch_names[i] for i in picks]
-    
-    # Detect bad channels
     ch_std = data.std(axis=1)
     flat_idx = np.where(ch_std < flat_thresh)[0]
     z = (ch_std - ch_std.mean()) / ch_std.std()
     high_idx = np.where(z > std_z_thresh)[0]
-    
     bad_idx = np.unique(np.concatenate([flat_idx, high_idx]))
     bad_channels = [ch_names[i] for i in bad_idx]
-    
-    # Mark bad channels in the raw object
     raw.info['bads'] = bad_channels
-    raw.set_eeg_reference('average', exclude='bads')
-        
+    good_picks = [p for p in picks if raw.ch_names[p] not in bad_channels]
+    good_data = raw.get_data(picks=good_picks)
+    avg_ref = good_data.mean(axis=0)
+    all_data = raw.get_data()
+    all_data[picks] = all_data[picks] - avg_ref
+    raw._data = all_data
+
     return raw, bad_channels
 
 def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
@@ -57,71 +58,54 @@ def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
     if robust:
         raw, bad_channels=robust_reference(raw)
         if interpolate_bad and bad_channels:
+            print(f"Interpolating bad channels: {bad_channels}")
             raw.interpolate_bads(reset_bads=True)
-    else:
-        raw.set_eeg_reference('average') 
+    
+    raw.set_eeg_reference('average') 
     return raw
 
-def ICA(eeg_data, sfreq=200):
-    # Get channel names (excluding marker if present)
-    ch_names = [col for col in eeg_data.columns if col != "marker"]
-    
-    # Extract data without the marker column and transpose
-    if "marker" in eeg_data.columns:
-        data = eeg_data[ch_names].to_numpy().T  # Shape: (n_channels, n_samples)
-    else:
-        data = eeg_data.to_numpy().T  # Shape: (n_channels, n_samples)
-    
-    print(f"Data shape: {data.shape}")
-    print(f"Number of channels: {len(ch_names)}")
-    
-    # Create MNE info structure
-    info = mne.create_info(
-        ch_names=ch_names,
-        sfreq=sfreq,
-        ch_types='eeg'
-    )
-    
-    # Add standard electrode positions (important for proper visualization)
-    try:
-        # Try to set standard 10-20 system positions
-        montage = mne.channels.make_standard_montage('standard_1020')
-        # Only use the channels that exist in our data
-        available_chs = [ch for ch in ch_names if ch in montage.ch_names]
-        if available_chs:
-            info.set_montage(montage)
-            print(f"Set montage for channels: {available_chs}")
-        else:
-            print("Warning: No standard channel names found for montage")
-    except Exception as e:
-        print(f"Could not set standard montage: {e}")
-    
-    # Create RawArray object
-    raw = mne.io.RawArray(data, info)
-    
-    # Apply proper band-pass filter (1-40 Hz recommended for ICA)
-    print("Applying band-pass filter (1-40 Hz)...")
-    raw.filter(1., 40., picks='eeg', method='fir', phase='zero-double')
-    
-    # Perform ICA
-    print("Fitting ICA (this may take a while)...")
-    ica = mne.preprocessing.ICA(
-        n_components=min(20, data.shape[0]),
-        random_state=42, 
-        method='fastica',
-        fit_params=dict(tol=1e-4)  # Convergence tolerance
-    )
-    ica.fit(raw)
-    
-    # Plot components to identify artifacts
-    print("Plotting ICA components...")
-    ica.plot_components()
-    
-    # Also plot the sources to help identify artifacts
-    print("Plotting ICA sources...")
-    ica.plot_sources(raw)
-    
-    return ica, raw
+
+import numpy as np
+import mne
+
+def remove_artifacts(raw, spike_threshold=40e-6, expand_samples=2):
+    raw_clean = raw.copy()
+    picks = mne.pick_types(raw_clean.info, eeg=True, exclude=[])
+    data = raw_clean.get_data(picks=picks)
+    spike_idx = np.any(np.abs(data) > spike_threshold, axis=0)
+    if expand_samples > 0:
+        expanded_idx = spike_idx.copy()
+        for shift in range(-expand_samples, expand_samples + 1):
+            if shift == 0:
+                continue
+            shifted = np.roll(spike_idx, shift)
+            # avoid wrap-around at edges
+            if shift < 0:
+                shifted[shift:] = False
+            else:
+                shifted[:shift] = False
+            expanded_idx |= shifted
+        spike_idx = expanded_idx
+
+    # Mark spikes as NaN
+    data[:, spike_idx] = np.nan
+
+    # Interpolate over NaNs for each EEG channel
+    n_channels = len(picks)
+    n_times = data.shape[1]
+    x = np.arange(n_times)
+    for i in range(n_channels):
+        nans = np.isnan(data[i])
+        if np.any(nans):
+            good = ~nans
+            data[i, nans] = np.interp(x[nans], x[good], data[i, good])
+
+    # Update raw object
+    raw_clean._data[picks, :] = data
+
+    return raw_clean
+
+
 
 #THIS SCALING HAS TO BE REVISED - This is just a fast implementation
 def scale(raw, scale_factor=1e6):
@@ -130,6 +114,12 @@ def scale(raw, scale_factor=1e6):
     data_scaled = data / scale_factor
     raw._data[picks, :] = data_scaled
     
+    return raw
+
+def preprocess_eeg(raw, scaling=1e6, high_cutoff= True, interpolate_bad=True, robust=True):
+    raw=scale(raw, scale_factor=scaling)
+    raw=PREP(raw, high_cutoff=  high_cutoff, interpolate_bad= interpolate_bad, robust=robust)
+    raw=remove_artifacts(raw)
     return raw
 
 
