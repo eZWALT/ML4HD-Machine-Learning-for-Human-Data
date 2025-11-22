@@ -37,11 +37,11 @@ def robust_reference(raw, std_z_thresh=3.0, flat_thresh=1e-6):
     
     # Mark bad channels in the raw object
     raw.info['bads'] = bad_channels
-    raw.set_eeg_reference('average')
+    raw.set_eeg_reference('average', exclude='bads')
         
     return raw, bad_channels
 
-def PREP(raw, high_cutoff= False, interpolate_bad=True, robust=True):
+def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
     
     if high_cutoff:
         raw.filter(
