@@ -1,0 +1,10 @@
+polars
+pandas
+jupyter
+pyodbc
+notebook
+matplotlib
+seaborn
+scikit-learn
+mne
+tensorflow
