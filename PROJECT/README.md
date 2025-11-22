@@ -23,9 +23,9 @@ We address three progressively challenging tasks, aiming for high accuracy acros
 
 The directory is structured in the following way:
 
-- **src**: Contains the notebooks used throughout the experimentation and can be used as 
-- **resources**: Contains images and miscellaneous documents
-- **documents**: Final report and report template 
+- **src**: Contains the notebooks used throughout the experimentation and other source code. 
+- **resources**: Contains past years examples, images and related publications.
+- **documents**: Final report and report template.
 
 ## TODO
 
@@ -44,6 +44,30 @@ Our current roadmap is:
     1. CNNs?
     2. GNNs?
     3. SNNs? (Prof. Rossi said its a bad approach)
+
+## Models Survey:
+
+The models that have been presented in the literature have been always revolving both sequences (temporal data) and convolutions (multiple signal channels). The are the branches of neural networks that we can explore: 
+
+1) Convolutional temporal neural networks:
+
+- [EEGNet (2018)](https://github.com/amrzhd/EEGNet)
+- [EEGInception (2021)](https://github.com/esantamariavazquez/EEG-Inception/tree/main)
+- [ATCNet (2022)](https://github.com/Altaheri/EEG-ATCNet/tree/main)
+- [EEGConformer (2022)](https://github.com/eeyhsong/EEG-Conformer)
+- [EEGNex (2022)](https://github.com/chenxiachan/EEGNeX)
+- [LMDA Code (2023)](https://github.com/MiaoZhengQing/LMDA-Code)
+- [EEGPT (2024)](https://github.com/BINE022/EEGPT)
+- [EEGDeformer (2024)](https://github.com/yi-ding-cs/EEG-Deformer)
+- [TCFormer (2025)](https://github.com/Altaheri/TCFormer)
+
+
+2) Graph Neural Networks:
+
+- [ST-GNN (2021)](https://github.com/LMissher/STGNN)
+- [NexusNet (2025)](https://github.com/ZikaiVan/NexusNet) 
+
+Many of this models can be found or acessed through the [Braindecode library](https://braindecode.org/stable/index.html).
 
 ## Usage 
 
