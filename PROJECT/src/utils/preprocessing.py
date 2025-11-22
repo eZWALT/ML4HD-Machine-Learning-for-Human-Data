@@ -2,7 +2,6 @@ from sklearn.decomposition import PCA
 import polars as pl
 import numpy as np
 import mne
-from mne import make_fixed_length_events
 #####################################################################
 
 ######## PREPROCESSING ###########
@@ -22,7 +21,6 @@ from mne import make_fixed_length_events
 # For this we will use independent component analysis (ICA) to identify and remove artifacts from the EEG data.
 
 def robust_reference(raw, std_z_thresh=3.0, flat_thresh=1e-6):
-    raw = raw.copy()
     picks = mne.pick_types(raw.info, eeg=True, exclude=[])
     data = raw.get_data(picks=picks)
     ch_names = [raw.ch_names[i] for i in picks]
@@ -40,7 +38,7 @@ def robust_reference(raw, std_z_thresh=3.0, flat_thresh=1e-6):
     all_data[picks] = all_data[picks] - avg_ref
     raw._data = all_data
 
-    return raw, bad_channels
+    return bad_channels
 
 def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
     
@@ -56,22 +54,16 @@ def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
         raw.filter(1., None, picks='eeg', method='fir', phase='zero-double') #WE CAN PLAY WITH THE FILTERING PARAMETERS HERE I HAVE NOT TESTED THIS YET
     
     if robust:
-        raw, bad_channels=robust_reference(raw)
+        bad_channels=robust_reference(raw)
         if interpolate_bad and bad_channels:
             print(f"Interpolating bad channels: {bad_channels}")
             raw.interpolate_bads(reset_bads=True)
     
     raw.set_eeg_reference('average') 
-    return raw
-
-
-import numpy as np
-import mne
 
 def remove_artifacts(raw, spike_threshold=40e-6, expand_samples=2):
-    raw_clean = raw.copy()
-    picks = mne.pick_types(raw_clean.info, eeg=True, exclude=[])
-    data = raw_clean.get_data(picks=picks)
+    picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+    data = raw.get_data(picks=picks)
     spike_idx = np.any(np.abs(data) > spike_threshold, axis=0)
     if expand_samples > 0:
         expanded_idx = spike_idx.copy()
@@ -101,10 +93,7 @@ def remove_artifacts(raw, spike_threshold=40e-6, expand_samples=2):
             data[i, nans] = np.interp(x[nans], x[good], data[i, good])
 
     # Update raw object
-    raw_clean._data[picks, :] = data
-
-    return raw_clean
-
+    raw._data[picks, :] = data
 
 
 #THIS SCALING HAS TO BE REVISED - This is just a fast implementation
@@ -113,14 +102,11 @@ def scale(raw, scale_factor=1e6):
     data, times = raw[picks, :]
     data_scaled = data / scale_factor
     raw._data[picks, :] = data_scaled
-    
-    return raw
 
 def preprocess_eeg(raw, scaling=1e6, high_cutoff= True, interpolate_bad=True, robust=True):
-    raw=scale(raw, scale_factor=scaling)
-    raw=PREP(raw, high_cutoff=  high_cutoff, interpolate_bad= interpolate_bad, robust=robust)
-    raw=remove_artifacts(raw)
-    return raw
+    scale(raw, scale_factor=scaling)
+    PREP(raw, high_cutoff=  high_cutoff, interpolate_bad= interpolate_bad, robust=robust)
+    remove_artifacts(raw)
 
 
 ####### COMPRESSION ###########
