@@ -1,4 +1,4 @@
-# ML4HD Project: Motor Imagery Classification for Brain Computer Interface 
+# Thought in Motion: A State-of-the-Art Survey on Motor Imagery Decoding from EEG
 
 <h1 align="center">
 <img src="resources/EEG_example.png" width="512">

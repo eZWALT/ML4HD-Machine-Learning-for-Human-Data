@@ -1,10 +1,11 @@
 polars
 pandas
-jupyter
-pyodbc
+ipykernel
 notebook
 matplotlib
 seaborn
 scikit-learn
-mne
 tensorflow
+mne 
+moabb
+braindecode
