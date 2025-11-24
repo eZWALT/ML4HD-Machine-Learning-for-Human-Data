@@ -8,12 +8,7 @@ import scipy
 from PIL import Image
 from scipy import ndimage
 import skimage.transform
-from cnn_utils import *
-from dataset_utils import *
 from sklearn.model_selection import train_test_split
-import keras_utils
-import random
-import os
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv2D, DepthwiseConv2D, SeparableConv2D
 from tensorflow.keras.layers import BatchNormalization, ELU, AveragePooling2D, Dropout, Softmax, Flatten

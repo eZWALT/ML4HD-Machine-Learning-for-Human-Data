@@ -109,6 +109,8 @@ def preprocess_eeg(raw, scaling=1e6, high_cutoff= True, interpolate_bad=True, ro
     remove_artifacts(raw)
 
 
+
+    
 ####### COMPRESSION ###########
 #We can implement here different compression techniques for EEG data, such as PCA, LTC and Autoencoders. Then we can compare them and see which one works better for our specific case.
 

@@ -9,12 +9,13 @@ import mne
 
 
 #####################################################################
-def get_file_names(folder_path="data"):
+
+def get_file_names(folder_path="../data", experiment=None):
     folder = Path(folder_path)
-    mat_files = list(folder.glob("*.mat"))
-    
-    print(f"Found {len(mat_files)} .mat files in {folder_path}:")
-    
+    mat_files = [file.name for file in folder.glob("*.mat")]
+    if experiment:
+        mat_files = [file for file in mat_files if file.startswith(experiment + "-")]
+    mat_files = [str(folder / file).replace('\\', '/') for file in mat_files]
     return mat_files
 
 def read_file(file_path):
@@ -120,15 +121,26 @@ def plot_eeg_signals(
 
     eeg_slice = eeg_data.slice(first_sample, last_sample - first_sample)
 
+
     # Time axis
     N = eeg_slice.height
     t = np.arange(N) * dt
 
+    eeg_slice_plot = eeg_slice.with_columns([
+        pl.col("marker") * 10
+    ]) if "marker" in channels else eeg_slice
     # Plot
     plt.figure(figsize=(12, 6))
+    # Plot EEG channels
     for ch in channels:
-        y = eeg_slice[ch].to_numpy()
-        plt.plot(t, y, label=ch)
+        if ch != "marker":
+            y = eeg_slice[ch].to_numpy()
+            plt.plot(t, y, label=ch)
+    
+    # Plot marker * 10 as integer steps
+    if "marker" in channels:
+        marker_data = eeg_slice["marker"].to_numpy() * 10
+        plt.plot(t, marker_data, label="marker ×10", color='red', linewidth=2, linestyle='--')
 
     plt.xlabel("Time (s)")
     plt.ylabel("Amplitude")
@@ -165,3 +177,166 @@ def power_spectrum(eeg_data, fs=200):
         plt.title(f"Power Spectrum of {col}")
         plt.tight_layout()
         plt.show()
+
+
+def plot_eeg_signals_with_events(
+    eeg_data,
+    first_sample=0,
+    window_size=None,       
+    freq=200,
+    channels=None           
+):
+    dt = 1 / freq
+    total_samples = eeg_data.height
+
+    if channels is None:
+        channels = [col for col in eeg_data.columns if col != "marker"]
+    else:
+        channels = [ch for ch in channels if ch in eeg_data.columns]
+
+    if window_size is None:
+        last_sample = total_samples
+    else:
+        samples_in_window = int(window_size)
+        last_sample = min(first_sample + samples_in_window, total_samples)
+
+    eeg_slice = eeg_data.slice(first_sample, last_sample - first_sample)
+
+    # Time axis
+    N = eeg_slice.height
+    t = np.arange(N) * dt
+
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    
+    # Plot EEG channels on top
+    for ch in channels:
+        if ch != "marker":
+            y = eeg_slice[ch].to_numpy()
+            ax1.plot(t, y, label=ch, alpha=0.7)
+    ax1.set_ylabel('EEG Amplitude')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot marker events on bottom with emphasis
+    if "marker" in channels:
+        marker_data = eeg_slice["marker"].to_numpy()
+        
+        # Plot the raw marker data
+        ax2.plot(t, marker_data, label='Raw Marker', alpha=0.3, color='gray')
+        
+        # Highlight non-zero events
+        event_mask = marker_data != 0
+        if np.any(event_mask):
+            ax2.scatter(t[event_mask], marker_data[event_mask] * 10, 
+                       color='red', s=30, label='Events ×10', zorder=5)
+            
+            # Add text labels for event values
+            for i in np.where(event_mask)[0]:
+                ax2.text(t[i], marker_data[i] * 10 + 0.5, f'{marker_data[i]}', 
+                        ha='center', va='bottom', fontsize=8, color='red')
+        
+        ax2.set_ylabel('Marker Value')
+        ax2.set_xlabel('Time (s)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(-1, max(35, marker_data.max() * 10 + 5))  # Adjust ylim for visibility
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print event statistics for this window
+    if "marker" in channels:
+        window_events = marker_data[marker_data != 0]
+        if len(window_events) > 0:
+            unique_events, event_counts = np.unique(window_events, return_counts=True)
+            print(f"Events in this window: {dict(zip(unique_events, event_counts))}")
+            
+
+import mne
+import numpy as np
+from pathlib import Path
+
+def create_epochs_from_your_data(eeg_data, marker_data, sfreq=200, epoch_duration=4, baseline_duration=0.2):
+    """
+    Convert your continuous EEG data to epochs for classification
+    
+    Parameters:
+    - eeg_data: Your EEG signals (channels x time)
+    - marker_data: Event markers with labels
+    - sfreq: Sampling frequency (200 Hz)
+    - epoch_duration: Length of each epoch in seconds
+    - baseline_duration: Baseline period before events
+    """
+    
+    # 1. Find event positions and labels from your marker channel
+    events = find_events_from_marker(marker_data, sfreq)
+    
+    # 2. Define your channel information
+    ch_names = ['X1', 'X2', 'X3', 'X4', 'X5']  # Adjust based on your channels
+    ch_types = ['eeg'] * len(ch_names)
+    
+    info = mne.create_info(
+        ch_names=ch_names, 
+        sfreq=sfreq, 
+        ch_types=ch_types
+    )
+    
+    # 3. Create epochs around events
+    epochs = mne.Epochs(
+        raw=eeg_data,  # You might need to create a Raw object first
+        events=events,
+        tmin=-baseline_duration,  # Start before event
+        tmax=epoch_duration,      # End after event
+        baseline=(None, 0),       # Baseline correction
+        preload=True
+    )
+    
+    return epochs
+
+def find_events_from_marker(marker_data, sfreq):
+
+    event_samples = np.where(np.diff(marker_data != 0) == True)[0] + 1
+    
+    # Get event values (your labels)
+    event_values = marker_data[event_samples]
+    
+    # Create events array for MNE: [sample, 0, value]
+    events = np.column_stack([
+        event_samples, 
+        np.zeros(len(event_samples)), 
+        event_values
+    ]).astype(int)
+    
+    return events
+
+
+def epochs_to_polars(epochs):
+    X = epochs.get_data()  # (n_epochs, n_channels, n_times)
+    y = epochs.events[:, 2]
+    times = epochs.times
+    channel_names = epochs.ch_names
+    
+    n_epochs, n_channels, n_times = X.shape
+    
+    # Reshape data to 2D: (n_epochs * n_times, n_channels)
+    X_2d = X.transpose(0, 2, 1).reshape(-1, n_channels)
+    
+    # Create repeating arrays for metadata
+    epoch_ids = np.repeat(np.arange(n_epochs), n_times)
+    labels = np.repeat(y, n_times)
+    time_points = np.tile(times, n_epochs)
+    
+    # Build dictionary for DataFrame
+    data_dict = {
+        'epoch_id': epoch_ids,
+        'time': time_points, 
+        'label': labels
+    }
+    
+    # Add channel data
+    for i, ch_name in enumerate(channel_names):
+        data_dict[ch_name] = X_2d[:, i]
+    
+    df = pl.DataFrame(data_dict)
+    return df
