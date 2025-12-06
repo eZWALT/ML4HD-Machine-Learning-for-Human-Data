@@ -6,6 +6,9 @@ import numpy as np
 from scipy.signal import welch
 import matplotlib.pyplot as plt
 import mne
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 
 #####################################################################
@@ -294,13 +297,10 @@ def create_epochs_from_your_data(eeg_data, marker_data, sfreq=200, epoch_duratio
     
     return epochs
 
-def find_events_from_marker(marker_data, sfreq):
-
+def find_events_from_marker(marker_data):
     event_samples = np.where(np.diff(marker_data != 0) == True)[0] + 1
-    
     # Get event values (your labels)
     event_values = marker_data[event_samples]
-    
     # Create events array for MNE: [sample, 0, value]
     events = np.column_stack([
         event_samples, 
@@ -340,3 +340,67 @@ def epochs_to_polars(epochs):
     
     df = pl.DataFrame(data_dict)
     return df
+
+def quick_XGBOOST_test(df):
+    exclude_cols = {'epoch_id', 'label', 'time'}
+    electrode_cols = [col for col in df.columns if col not in exclude_cols]
+    # Ensure the DataFrame is sorted by epoch_id and time for consistent reshaping
+    df = df.sort(['epoch_id', 'time'])
+
+    epoch_df = df.group_by('epoch_id').agg(
+        pl.col('label').first().alias('label'),
+        pl.col('time').count().alias('time_count')
+    )
+
+    # Check if all epochs have the same number of time steps (for reshaping)
+    time_counts = epoch_df['time_count'].unique()
+    if len(time_counts) > 1:
+        raise ValueError("Epochs have varying time steps; padding or truncation needed.")
+
+
+    num_epochs = len(epoch_df)
+    time_steps = epoch_df['time_count'][0]
+    num_electrodes = len(electrode_cols)
+    y = epoch_df['label'].to_numpy()
+    data = df.select(electrode_cols).to_numpy()
+
+    # Reshape to 3D: (num_epochs, time_steps, num_electrodes)
+    X_3d = data.reshape(num_epochs, time_steps, num_electrodes)
+    # Flatten to 2D for XGBoost: (num_epochs, time_steps * num_electrodes)
+    X = X_3d.reshape(num_epochs, -1)
+
+    print(X.shape, y.shape)  # Should be (num_epochs, time_steps * num_electrodes) and (num_epochs,)
+
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    num_classes = len(np.unique(y))
+    if num_classes == 2:
+        objective = 'binary:logistic'
+    else:
+        objective = 'multi:softmax'
+
+    params = {'objective': objective}
+    if num_classes > 2:
+        params['num_class'] = num_classes
+
+    # Initialize and train the XGBoost Classifier
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        eval_metric='mlogloss' if num_classes > 2 else 'logloss',
+        random_state=42,
+        **params
+    )
+
+    print("Starting XGBoost training...")
+    xgb_model.fit(X_train, y_train)
+    print("Training complete.")
+
+    # Make predictions on the test set
+    y_pred = xgb_model.predict(X_test)
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"\nModel Accuracy on Test Set: {accuracy * 100:.2f}%")

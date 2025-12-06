@@ -51,7 +51,7 @@ def PREP(raw, high_cutoff= True, interpolate_bad=True, robust=True):
         phase='zero-double' # Zero-phase filtering (no time shift in signal)
         )
     else:
-        raw.filter(1., None, picks='eeg', method='fir', phase='zero-double') #WE CAN PLAY WITH THE FILTERING PARAMETERS HERE I HAVE NOT TESTED THIS YET
+        raw.filter(1., None, picks='eeg', method='fir', phase='zero-double') 
     
     if robust:
         bad_channels=robust_reference(raw)
@@ -105,9 +105,11 @@ def scale(raw, scale_factor=1e6):
 
 def preprocess_eeg(raw, scaling=1e6, high_cutoff= True, interpolate_bad=True, robust=True):
     scale(raw, scale_factor=scaling)
-    PREP(raw, high_cutoff=  high_cutoff, interpolate_bad= interpolate_bad, robust=robust)
+    PREP(raw, high_cutoff=  high_cutoff, interpolate_bad= interpolate_bad, robust=robust) 
+    raw.set_eeg_reference(ref_channels=['A1','A2'])
+    raw.drop_channels(['A1','A2'])
     remove_artifacts(raw)
-
+    #raw.resample(128, npad="auto")
 
 
     
