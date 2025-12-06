@@ -1,15 +1,16 @@
-
+import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Activation, Permute, Dropout
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D
+from tensorflow.keras.layers import Dense, Activation, Dropout
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D
 from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.layers import SpatialDropout2D
-from tensorflow.keras.regularizers import l1_l2
 from tensorflow.keras.layers import Input, Flatten
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras import backend as K
-
+from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
+from tensorflow.keras.models import Model
+from typing import List
 
 def EEGNet(nb_classes, Chans = 64, Samples = 128, 
              dropoutRate = 0.5, kernLength = 64, F1 = 8, 
@@ -232,3 +233,119 @@ def ShallowConvNet(nb_classes, Chans = 64, Samples = 128, dropoutRate = 0.5):
     
     return Model(inputs=input_main, outputs=softmax)
 
+
+#################################################################
+
+
+def Inception(nb_classes, Chans = 64, Samples = 256):
+   
+    input_main = Input(shape=(Chans,Samples)) # (None, 301, 19)
+    print(input_main.shape)
+    block1       = Inception_module(
+                    input_tensor=input_main,
+                    bottleneck_size=nb_classes*3
+                    )
+    block1       = Inception_module(
+                    input_tensor=block1,
+                    bottleneck_size=nb_classes*3
+                    )
+    block1       = Inception_module(
+                    input_tensor=block1,
+                    bottleneck_size=nb_classes*3
+                    )
+  
+   # ---  Residual Mapping F(x0, {Wi}) ---
+    residual_mapping = Conv1D(
+        filters=block1.shape[-1],
+        kernel_size=1,
+        padding='same',
+        activation='linear', 
+    )(input_main) 
+    block1 = Add()([residual_mapping, block1])
+    
+    block2       =  Inception_module(
+                    input_tensor=block1,
+                    bottleneck_size=nb_classes*3
+                    )
+    block2       =  Inception_module(
+                    input_tensor=block2,
+                    bottleneck_size=nb_classes*3
+                    )   
+    block2       =  Inception_module(
+                    input_tensor=block2,
+                    bottleneck_size=nb_classes*3
+                    )
+    
+    # ---  Residual Mapping F(x0, {Wi}) ---
+    residual_mapping = Conv1D(
+        filters=block2.shape[-1],
+        kernel_size=1,
+        padding='same',
+        activation='linear', 
+    )(block1) 
+    block2 = Add()([residual_mapping, block2])
+    
+    avg_pool_1d = AveragePooling1D(
+    pool_size=2,  # Window size for averaging (e.g., reduce time_steps by half)
+    strides=2,    # How far the window moves (usually same as pool_size for downsampling)
+    padding='valid' # Or 'same'
+    )(block2)
+    flatten      = Flatten()(avg_pool_1d)
+    
+    dense        = Dense(nb_classes, kernel_constraint = max_norm(0.5))(flatten)
+    softmax      = Activation('softmax')(dense)
+    
+    return Model(inputs=input_main, outputs=softmax)
+
+
+
+def Inception_module(input_tensor,bottleneck_size=3*19, conv_kernel_sizes = [20, 60, 100, 150, 200]):
+    
+    # --- 1. Bottleneck Layer (Conv1D with kernel size 1) ---
+    bottleneck = Conv1D(
+        filters=bottleneck_size,
+        kernel_size=1,
+        padding='same',
+        activation='linear',
+    )(input_tensor)
+    
+    # --- 2. Parallel Convolutional Layers  ---
+    parallel_features = []
+    
+    for i, kernel_size in enumerate(conv_kernel_sizes):
+        conv_branch = Conv1D(
+            filters=bottleneck_size,
+            kernel_size=kernel_size,
+            padding='same', # 'same' padding ensures output length is same as input
+            activation='linear',
+        )(bottleneck)
+        parallel_features.append(conv_branch)
+        
+    # --- 1.2 . Max Pooling Layer ---
+    pool = MaxPool1D(
+        pool_size=20,
+        strides=1, 
+        padding='same',
+    )(input_tensor)
+
+    # --- 2.2. 1x1 Convolution to Enlarge Depth ---
+    
+    pool_conv = Conv1D(
+        filters=bottleneck_size,
+        kernel_size=1,
+        padding='same',
+        activation='linear',
+    )(pool)
+    parallel_features.append(pool_conv)
+        
+    # --- 3. Concatenation ---
+    concat = Concatenate(axis=-1,)(parallel_features)
+    
+
+    # --- 4. Batch Normalization ---
+    bn = BatchNormalization()(concat)
+    
+    # --- 5. ReLU Activation ---
+    output_tensor = Activation('relu' )(bn)
+    
+    return output_tensor
