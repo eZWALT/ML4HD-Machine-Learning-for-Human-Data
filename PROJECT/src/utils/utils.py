@@ -9,7 +9,7 @@ import mne
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-
+import lightgbm as lgb
 
 #####################################################################
 
@@ -63,7 +63,7 @@ def read_file(file_path):
         print(f"Error reading {file_path}: {e}")
         return None, None
     
-def read_file_to_raw(file_path, drop_channels=['X5']):
+def read_file_to_raw(file_path):
     try:
         mat_data = scipy.io.loadmat(file_path)
         subject_info = ((file_path.split("/")[-1]).split(".")[0]).split("-")
@@ -73,14 +73,10 @@ def read_file_to_raw(file_path, drop_channels=['X5']):
         all_channel_names = []  # Keep track of all original channels
         for i in range(o_data["chnames"].shape[0]):
             ch_name = str(o_data["chnames"][i][0]).replace("[", "").replace("]", "").replace("'", "").strip()
-            all_channel_names.append(ch_name)
-            if ch_name not in drop_channels:
-                channel_names.append(ch_name)
-        
-        print(f"Channels: {channel_names}")
+            channel_names.append(ch_name)
 
         full_data = o_data['data']  
-        keep_indices = [i for i, ch_name in enumerate(all_channel_names) if ch_name not in drop_channels]
+        keep_indices = [i for i, ch_name in enumerate(all_channel_names)]
         eeg_data = full_data[:, keep_indices].T  # Shape: (n_channels, n_samples)
         info = mne.create_info(
             ch_names=channel_names,
@@ -404,3 +400,89 @@ def quick_XGBOOST_test(df):
     # Evaluate the model
     accuracy = accuracy_score(y_test, y_pred)
     print(f"\nModel Accuracy on Test Set: {accuracy * 100:.2f}%")
+
+def quick_LGBM_test(df: pl.DataFrame):
+    """
+    Transforms 3D electrode/time-series data (in a Polars DataFrame)
+    into a 2D feature matrix and trains a LightGBM Classifier.
+
+    Args:
+        df (pl.DataFrame): The input Polars DataFrame containing
+                           'epoch_id', 'label', 'time', and electrode columns.
+    """
+    # --- 1. Data Preparation (Identical to XGBoost version) ---
+    exclude_cols = {'epoch_id', 'label', 'time'}
+    electrode_cols = [col for col in df.columns if col not in exclude_cols]
+    
+    # Ensure the DataFrame is sorted by epoch_id and time for consistent reshaping
+    # Use with_columns to prevent sorting a full copy if not needed
+    df = df.sort(['epoch_id', 'time']) 
+
+    epoch_df = df.group_by('epoch_id').agg(
+        pl.col('label').first().alias('label'),
+        pl.col('time').count().alias('time_count')
+    )
+
+    # Check if all epochs have the same number of time steps (for reshaping)
+    time_counts = epoch_df['time_count'].unique()
+    if len(time_counts) > 1:
+        raise ValueError("Epochs have varying time steps; padding or truncation needed.")
+
+
+    num_epochs = len(epoch_df)
+    time_steps = epoch_df['time_count'][0]
+    num_electrodes = len(electrode_cols)
+    y = epoch_df['label'].to_numpy()
+    data = df.select(electrode_cols).to_numpy()
+
+    # Reshape to 3D: (num_epochs, time_steps, num_electrodes)
+    X_3d = data.reshape(num_epochs, time_steps, num_electrodes)
+    # Flatten to 2D for LightGBM: (num_epochs, time_steps * num_electrodes)
+    X = X_3d.reshape(num_epochs, -1)
+
+    print(f"X shape: {X.shape}, y shape: {y.shape}") 
+
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    # --- 2. LightGBM Model Setup (Changes are here) ---
+    num_classes = len(np.unique(y))
+    
+    # LightGBM objective mapping
+    if num_classes == 2:
+        lgbm_objective = 'binary'
+        lgbm_metric = 'binary_logloss'
+    elif num_classes > 2:
+        lgbm_objective = 'multiclass'
+        lgbm_metric = 'multi_logloss'
+    else:
+        raise ValueError("Target variable 'label' must have at least 2 classes.")
+
+
+    # Initialize and train the LightGBM Classifier
+    # Note: LightGBM uses 'objective' and 'metric' directly as parameters
+    lgbm_model = lgb.LGBMClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        objective=lgbm_objective,
+        metric=lgbm_metric,
+        num_class=num_classes if num_classes > 2 else 1, # Set num_class for multiclass
+        random_state=42,
+        n_jobs=-1, # Use all available cores for parallel processing (key for speed)
+        verbose=-1 # Suppress fit warnings/messages for cleaner output
+    )
+
+    print("Starting LightGBM training...")
+    # LightGBM fits just like any other scikit-learn model
+    lgbm_model.fit(X_train, y_train) 
+    print("Training complete.")
+
+    # Make predictions on the test set
+    y_pred = lgbm_model.predict(X_test)
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"\nModel Accuracy on Test Set: {accuracy * 100:.2f}%")
+    
