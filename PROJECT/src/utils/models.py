@@ -11,7 +11,79 @@ from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
 from tensorflow.keras.models import Model
 from typing import List
+from tensorflow.keras.layers import  LSTM, GRU
+from tensorflow.keras.regularizers import l2
 
+
+def Simple_CNN(nb_classes, input_shape=(64, 128, 1)):
+        
+    input1   = Input(shape =input_shape)
+    block1 =  Conv2D(32, (3, 3), activation='elu', padding='same')(input1)
+    block1 = BatchNormalization()(block1)
+    block1 = MaxPooling2D((2, 1))(block1) # Only reduce height, keep time width
+
+    # 2. Second Convolutional Block
+    block2 = Conv2D(64, (3, 3), activation='elu', padding='same')(block1)
+    block2 = BatchNormalization()(block2)
+    block2 = MaxPooling2D((2, 1))(block2)
+
+    # 3. Flatten and Classify
+    block3 = Flatten()(block2)
+    block3 = Dense(64, activation='elu')(block3)
+    block3 = Dropout(0.5)(block3) # Prevent overfitting
+
+    dense = Dense(nb_classes)(block3)
+ 
+    softmax = Activation('softmax')(dense)
+    
+    return Model(inputs=input1, outputs=softmax)
+
+
+def Simple_LSTM(nb_classes, input_shape=(3, 187)):
+    input1   = Input(shape =input_shape)
+    # 1. Normalize the CSP inputs immediately
+    x = BatchNormalization()(input1)
+    
+    # 2. Stacked LSTM with L2 Regularization
+    # We use return_sequences=True to pass the sequence to the next LSTM
+    x = LSTM(64, return_sequences=True, kernel_regularizer=l2(0.01))(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+    
+    x = LSTM(32, return_sequences=True, kernel_regularizer=l2(0.01))(x)
+    x = BatchNormalization()(x)
+    
+    x = LSTM(32, return_sequences=False, kernel_regularizer=l2(0.01))(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+    # 3. Dense classification head
+    x = Dense(64, activation='elu', kernel_regularizer=l2(0.01))(x)
+    x = Dropout(0.5)(x)
+    
+    dense = Dense(nb_classes)(x)
+    softmax = Activation('softmax')(dense)
+    
+    return Model(inputs=input1, outputs=softmax)
+
+
+def Simple_GRU(nb_classes, input_shape=(3, 187)):
+    input1   = Input(shape =input_shape)
+    # input_shape: (Time_Steps, Features) -> (3, 187)
+    x = BatchNormalization()(input1)
+    
+    x = GRU(128, kernel_regularizer=l2(0.01), return_sequences=False)(x)
+    x = BatchNormalization()(x)
+    
+    # Deep Dense block to process the GRU output
+    x = Dense(64, activation='elu', kernel_regularizer=l2(0.01))(x)
+    x = Dropout(0.5)(x)
+    
+    dense = Dense(nb_classes)(x)
+    softmax = Activation('softmax')(dense)
+    
+    return Model(inputs=input1, outputs=softmax)
+
+##################################3
 def EEGNet(nb_classes, Chans = 64, Samples = 128, 
              dropoutRate = 0.5, kernLength = 64, F1 = 8, 
              D = 2, F2 = 16, norm_rate = 0.25, dropoutType = 'Dropout'):
