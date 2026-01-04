@@ -355,3 +355,13 @@ def Inception_module(input_tensor,bottleneck_size=3*19, conv_kernel_sizes = [20,
     output_tensor = Activation('relu' )(bn)
     
     return output_tensor
+
+
+##################
+# EEGConformer   #
+##################
+
+# Conformer models are simply CNNs + Attention based recurrent networks to overcome the short temporal patterns that 2D convolutions
+# Are able to capture (Data as 2D matrices time-frequency)
+    # We want
+def EEGConformer():
