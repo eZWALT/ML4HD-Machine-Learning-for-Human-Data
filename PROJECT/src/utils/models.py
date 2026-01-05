@@ -1,24 +1,21 @@
+from typing import List
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Activation, Dropout
+from tensorflow.keras.layers import  LSTM, GRU
+from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
+from tensorflow.keras.layers import Input, Flatten, Dense, Activation, Dropout
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D
-from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.layers import SpatialDropout2D
-from tensorflow.keras.layers import Input, Flatten
+from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D, SpatialDropout2D
+from tensorflow.keras.layers import BatchNormalization, LayerNormalization, Add, MultiHeadAttention
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
-from tensorflow.keras.models import Model
-from typing import List
-from tensorflow.keras.layers import  LSTM, GRU
 from tensorflow.keras.regularizers import l2
 
 
 def Simple_CNN(nb_classes, input_shape=(64, 128, 1)):
         
-    input1   = Input(shape =input_shape)
-    block1 =  Conv2D(32, (3, 3), activation='elu', padding='same')(input1)
+    input1 = Input(shape =input_shape)
+    block1 = Conv2D(32, (3, 3), activation='elu', padding='same')(input1)
     block1 = BatchNormalization()(block1)
     block1 = MaxPooling2D((2, 1))(block1) # Only reduce height, keep time width
 
@@ -357,11 +354,181 @@ def Inception_module(input_tensor,bottleneck_size=3*19, conv_kernel_sizes = [20,
     return output_tensor
 
 
-##################
-# EEGConformer   #
-##################
+####################
+# Conformer Models #
+####################
 
-# Conformer models are simply CNNs + Attention based recurrent networks to overcome the short temporal patterns that 2D convolutions
-# Are able to capture (Data as 2D matrices time-frequency)
-    # We want
-def EEGConformer():
+############ COMMON MODULES
+
+# CNN Stem -> Tokens
+def PatchEmbedding(
+    input_tensor,
+    n_filters_time=40,
+    filter_time_length=25,
+    n_chans=64,
+    pool_time_length=75,
+    pool_time_stride=15,
+    drop_prob=0.5
+):
+    # Temporal Convolution (1 x Lt)
+    x = Conv2D(
+        n_filters_time, 
+        (1, filter_time_length),
+        padding="valid",
+        use_bias=True
+    )(input_tensor)
+    
+    # Spatial Convolution (N Channels x 1)
+    x = Conv2D(
+        n_filters_time, 
+        (n_chans, 1),
+        padding="valid",
+        use_bias=True,
+    )(x)
+
+    # Batch Normalization, activation and temporal pooling --> patches and dropout
+    x = BatchNormalization()(x)
+    x = Activation("elu")(x)
+    x = AveragePooling2D(
+        pool_size=(1, pool_time_length),
+        strides=(1, pool_time_stride),
+    )(x)
+    x = Dropout(drop_prob)(x)
+    # 1x1 projection
+    x = Conv2D(n_filters_time, (1, 1), padding="same")(x)
+    # (B, D, 1, T) → (B, T, D)
+    x = Reshape((-1, n_filters_time))(x)
+    return x
+
+def TransformerEncoderBlock(
+    x, 
+    emb_size,
+    num_heads,
+    att_drop=0.5,
+    ff_expansion=4,
+): 
+    # --- SELF ATTENTION ---
+    x_norm = LayerNormalization(epsilon=1e-6)(x)
+    attn = MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=emb_size // num_heads,
+        dropout=att_drop,
+    )(x_norm, x_norm)
+    # Dropout + skip connection
+    attn = Dropout(att_drop)(attn)
+    x = Add()([x, attn])
+
+    # --- FEED FROWARD ---
+    x_norm = LayerNormalization(epsilon=1e-6)(x)
+    ff = Dense(ff_expansion * emb_size, activation="gelu")(x_norm)
+    # 2 dense layers, dropout + skip connection
+    ff = Dropout(att_drop)(ff)
+    ff = Dense(emb_size)(ff)
+    ff = Dropout(att_drop)(ff)
+    x = Add()([x, ff]) 
+    
+    return x
+
+def TransformerEncoder(
+        x, 
+        num_layers,
+        emb_size,
+        num_heads,
+        att_drop,
+):
+    for _ in range(num_layers):
+        x = TransformerEncoderBlock(
+            x, 
+            emb_size=emb_size,
+            num_heads=num_heads,
+            att_drop=att_drop,
+        )
+    return x 
+
+def ClassificationHead(
+    x,
+    nb_classes,
+    hidden_units=(256, 32),
+    drop_probs=(0.5, 0.3),
+    activation="elu",
+    use_batchnorm=False,
+):
+    """
+    Generic classification head (N Layers).
+    ----------
+    x : tf.Tensor
+        Input feature tensor.
+    nb_classes : int
+        Number of output classes.
+    hidden_units : tuple[int]
+        Sizes of hidden dense layers.
+    activation : str
+        Activation function for hidden layers.
+    drop_probs : tuple[float]
+        Dropout probability after each hidden layer.
+    use_batchnorm : bool
+        Whether to apply BatchNorm after dense layers.
+    """
+    x = Flatten()(x)
+
+    for i, units in enumerate(hidden_units):
+        x = Dense(units, activation=activation)(x)
+        if use_batchnorm:
+            x = BatchNormalization()(x)
+        if i < len(drop_probs):
+            x = Dropout(drop_probs[i])(x)
+
+    return Dense(nb_classes, activation="softmax")(x)
+
+
+def PositionalEncoding(tf.keras.layers.Layer):
+    def __init__(self, seq_len, embed_dim, drop_rate=0.1):
+        super().__init__()
+        self.pos_emb = self.add_weight(
+            shape=(1, seq_len, embed_dim),
+            initializer="random_normal",
+            trainable=True, 
+        )
+        self.dropout = Dropout(drop_rate)
+
+    def call(self, x, training=False):
+        x = x + self.pos_emb[:, :tf.shape(x)[1], :]
+        return self.dropout(x, training=training) 
+
+
+############ COMMON MODULES
+
+def EEGConformer(
+    nb_classes, Chans = 64, Samples = 256, n_filters_time=40,
+    filter_time_length=25,pool_time_length=75,  pool_time_stride=15,
+    drop_prob=0.5, num_layers=6, num_heads=10, att_drop_prob=0.5
+) -> Model:
+
+    input_eeg = Input(shape=(Chans, Samples, 1))
+
+    # 1. Patch embedding. Use a CNN to get embeddings from temporal windows
+    # EEG signal (64 x 256) -> (CNN) -> 40 Filters -> (Pooling) -> T patches of 40-D vectors 
+    x = PatchEmbedding(
+        input_tensor=input_eeg,
+        n_filters_time=n_filters_time, 
+        n_chans=Chans,
+        pool_time_length=pool_time_length, 
+        pool_time_stride=pool_time_stride,
+        drop_prob=drop_prob
+    )
+
+    # 2. Transformer Encoder
+    x = TransformerEncoder(
+        x, 
+        num_layers=num_layers,
+        emb_size=n_filters_time,
+        num_heads=num_heads,
+        att_drop=att_drop_prob,
+    )
+
+    # 3. Final classification head 
+    x = ClassificationHead(x, nb_classes, use_batchnorm=False)
+    return Model(inputs=input_eeg, outputs=x)
+
+def CTNet(nb_classes, Chans = 64, Samples = 256):
+    pass 
