@@ -1,5 +1,6 @@
 from typing import List
 import tensorflow as tf
+from tensorflow.keras.layers import Layer 
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import  LSTM, GRU
 from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
@@ -481,11 +482,12 @@ def ClassificationHead(
     return Dense(nb_classes, activation="softmax")(x)
 
 
-def PositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, seq_len, embed_dim, drop_rate=0.1):
+# TODO: This is now a layer object but maybe we would rather prefer it in functional form
+def PositionalEncoding(Layer):
+    def __init__(self, seq_len, emb_size, drop_rate=0.1):
         super().__init__()
         self.pos_emb = self.add_weight(
-            shape=(1, seq_len, embed_dim),
+            shape=(1, seq_len, emb_size),
             initializer="random_normal",
             trainable=True, 
         )
@@ -495,13 +497,23 @@ def PositionalEncoding(tf.keras.layers.Layer):
         x = x + self.pos_emb[:, :tf.shape(x)[1], :]
         return self.dropout(x, training=training) 
 
+#def PositionalEncoding(seq_len, emb_size=40, drop_rate=0.1):
+    
 
 ############ COMMON MODULES
 
 def EEGConformer(
-    nb_classes, Chans = 64, Samples = 256, n_filters_time=40,
-    filter_time_length=25,pool_time_length=75,  pool_time_stride=15,
-    drop_prob=0.5, num_layers=6, num_heads=10, att_drop_prob=0.5
+    nb_classes,
+    Chans = 64,
+    Samples = 256,
+    n_filters_time=40, 
+    filter_time_length=25,
+    pool_time_length=75,
+    pool_time_stride=15,
+    drop_prob=0.5,
+    num_layers=6,
+    num_heads=10,
+    att_drop_prob=0.5
 ) -> Model:
 
     input_eeg = Input(shape=(Chans, Samples, 1))
@@ -511,6 +523,7 @@ def EEGConformer(
     x = PatchEmbedding(
         input_tensor=input_eeg,
         n_filters_time=n_filters_time, 
+        filter_time_length=filter_time_length,
         n_chans=Chans,
         pool_time_length=pool_time_length, 
         pool_time_stride=pool_time_stride,
@@ -530,5 +543,66 @@ def EEGConformer(
     x = ClassificationHead(x, nb_classes, use_batchnorm=False)
     return Model(inputs=input_eeg, outputs=x)
 
-def CTNet(nb_classes, Chans = 64, Samples = 256):
+def CTNet(
+    nb_classes,
+    Chans = 64,
+    Samples = 256,
+    num_heads=4,
+    num_layers=6,
+    emb_size=40, 
+    cnn_drop_rate=0.3,
+    attn_drop_rate=0.1, 
+    final_drop_rate=0.5,
+) -> Model:
+    inputs = Input(shape=(Chans, Samples))
+
+    # Ensure dim: (batch, n_chans, n_times)
+    x = Reshape((1, Chans, Samples))(inputs)
+
+    # CNN Patch Embedding generator
+    #cnn = 
+
+    # n_times 
+
+    # Positional Encoding of Embeddings
+    position = PositionalEncoding(
+        emb_size=emb_size, 
+        drop_rate=attn_drop_rate,
+        #seq_len=Samples # This is not correct, n_times??? is it the sample as samples?
+    )
+
+    transformer = TransformerEncoder(
+        x,
+        num_layers=num_layers, 
+        num_heads=num_heads, 
+        emb_size=emb_size,
+    )
+
+    classificator = ClassificationHead(
+        x,
+        nb_classes=nb_classes
+    )
+
+    return None
+
+
+#################
+# CUSTOM MODELS #
+################# 
+# Walter, Josu et. al 
+
+def MindReaderNet(
+    nb_classes,
+    Chans = 64,
+    Samples = 256,
+    n_filters_time=40, 
+    filter_time_length=25,
+    pool_time_length=75,
+    pool_time_stride=15,
+    drop_prob=0.5,
+    num_layers=6,
+    num_heads=10,
+    att_drop_prob=0.5
+    # TODO : add more hyperparameters
+) -> Model:
     pass 
