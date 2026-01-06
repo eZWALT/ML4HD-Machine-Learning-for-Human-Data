@@ -362,6 +362,7 @@ def Inception_module(input_tensor,bottleneck_size=3*19, conv_kernel_sizes = [20,
 ############ COMMON MODULES
 
 # CNN Stem -> Tokens
+# ShallowConvNet style of embeddings
 def PatchEmbedding(
     input_tensor,
     n_filters_time=40,
@@ -371,7 +372,7 @@ def PatchEmbedding(
     pool_time_stride=15,
     drop_prob=0.5
 ):
-    # Temporal Convolution (1 x Lt)
+    # Temporal Convolution (1 x Lt) . Frequency like
     x = Conv2D(
         n_filters_time, 
         (1, filter_time_length),
@@ -379,7 +380,7 @@ def PatchEmbedding(
         use_bias=True
     )(input_tensor)
     
-    # Spatial Convolution (N Channels x 1)
+    # Spatial Convolution (N Channels x 1). Sensor Mixing
     x = Conv2D(
         n_filters_time, 
         (n_chans, 1),
@@ -388,6 +389,7 @@ def PatchEmbedding(
     )(x)
 
     # Batch Normalization, activation and temporal pooling --> patches and dropout
+    # Pooling defines the token size!
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
     x = AveragePooling2D(
@@ -400,6 +402,57 @@ def PatchEmbedding(
     # (B, D, 1, T) → (B, T, D)
     x = Reshape((-1, n_filters_time))(x)
     return x
+
+# EEGNet style of embeddings
+def CTNetPatchEmbedding(
+    x,
+    n_chans,
+    emb_size=40,
+    kernel_size=64,
+    depth_multiplier=2,
+    pool_size_1=8,
+    pool_size_2=8,
+    drop_rate=0.3,
+):
+    # Temporal conv 
+    x = Conv2D(
+        emb_size // 2,
+        (1, kernel_size),
+        padding="same",
+        use_bias=False,
+    )(x)
+    x = BatchNormalization()(x)
+
+    # Spatial filtering (Depthwise)
+    x = Conv2D(
+        (emb_size // 2) * depth_multiplier,
+        (n_chans, 1),
+        groups=emb_size // 2,
+        use_bias=False,
+    )(x)
+    x = BatchNormalization()(x)
+    x = Activation("elu")(x)
+
+    x = AveragePooling2D((1, pool_size_1))(x)
+    x = Dropout(drop_rate)(x)
+
+    # Refinement
+    x = Conv2D(
+        emb_size,
+        (1, 16),
+        padding="same",
+        use_bias=False,
+    )(x)
+    x = BatchNormalization()(x)
+    x = Activation("elu")(x)
+
+    x = AveragePooling2D((1, pool_size_2))(x)
+    x = Dropout(drop_rate)(x)
+
+    # tokens
+    x = Reshape((-1, emb_size))(x)
+    return x
+
 
 def TransformerEncoderBlock(
     x, 
@@ -482,22 +535,14 @@ def ClassificationHead(
     return Dense(nb_classes, activation="softmax")(x)
 
 
-# TODO: This is now a layer object but maybe we would rather prefer it in functional form
-def PositionalEncoding(Layer):
-    def __init__(self, seq_len, emb_size, drop_rate=0.1):
-        super().__init__()
-        self.pos_emb = self.add_weight(
-            shape=(1, seq_len, emb_size),
-            initializer="random_normal",
-            trainable=True, 
-        )
-        self.dropout = Dropout(drop_rate)
-
-    def call(self, x, training=False):
-        x = x + self.pos_emb[:, :tf.shape(x)[1], :]
-        return self.dropout(x, training=training) 
-
-#def PositionalEncoding(seq_len, emb_size=40, drop_rate=0.1):
+def PositionalEncoding(x, seq_len, emb_size, drop_rate=0.1):
+    pos_emb = tf.Variable(
+        initial_value=tf.random.normal((1, seq_len, emb_size)),
+        trainable=True,
+        name="pos_embedding",
+    )
+    x = x + pos_emb[:, :tf.shape(x)[1], :]
+    return Dropout(drop_rate)(x)
     
 
 ############ COMMON MODULES
@@ -545,45 +590,60 @@ def EEGConformer(
 
 def CTNet(
     nb_classes,
-    Chans = 64,
-    Samples = 256,
+    Chans=64,
+    Samples=256,
+    emb_size=40,
     num_heads=4,
     num_layers=6,
-    emb_size=40, 
     cnn_drop_rate=0.3,
-    attn_drop_rate=0.1, 
+    attn_drop_rate=0.1,
     final_drop_rate=0.5,
 ) -> Model:
+
     inputs = Input(shape=(Chans, Samples))
 
-    # Ensure dim: (batch, n_chans, n_times)
+    # (B, 1, C, T)
     x = Reshape((1, Chans, Samples))(inputs)
 
-    # CNN Patch Embedding generator
-    #cnn = 
-
-    # n_times 
-
-    # Positional Encoding of Embeddings
-    position = PositionalEncoding(
-        emb_size=emb_size, 
-        drop_rate=attn_drop_rate,
-        #seq_len=Samples # This is not correct, n_times??? is it the sample as samples?
-    )
-
-    transformer = TransformerEncoder(
+    # 1. CNN patch embedding (EEGNet style)
+    cnn_tokens = CTNetPatchEmbedding(
         x,
-        num_layers=num_layers, 
-        num_heads=num_heads, 
+        n_chans=Chans,
         emb_size=emb_size,
+        drop_rate=cnn_drop_rate,
     )
 
-    classificator = ClassificationHead(
-        x,
-        nb_classes=nb_classes
+    # Scale embeddings (standard transformer trick apparently)
+    cnn_tokens = cnn_tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
+
+    # 2. Add Positional encoding to patch embeddings 
+    seq_len = cnn_tokens.shape[1]
+    cnn_tokens = PositionalEncoding(
+        cnn_tokens,
+        seq_len=seq_len,
+        emb_size=emb_size,
+        drop_rate=attn_drop_rate,
     )
 
-    return None
+    # 3. Transformer encoder embedding enhancement through attention 
+    att_tokens = TransformerEncoder(
+        cnn_tokens,
+        num_layers=num_layers, 
+        emb_size=emb_size,
+        num_heads=num_heads,
+        att_drop=attn_drop_rate 
+    )
+
+    # 4. Skip connection embeddins (cnn + attention)
+    features = Add()([cnn_tokens, att_tokens])
+
+    # 5. Classification 
+    x = Flatten()(features)
+    x = Dropout(final_drop_rate)(x)
+    outputs = Dense(nb_classes, activation="softmax")(x)
+
+    return Model(inputs, outputs)
+
 
 
 #################
@@ -591,7 +651,129 @@ def CTNet(
 ################# 
 # Walter, Josu et. al 
 
-def MindReaderNet(
+
+# -------------------------------------------------------------------------
+# Multi Scale Patch Embedding 
+
+# This multiple kernel size patch embedding learns multiple
+# temporal scales (multiple receptive fields), because EEG signals 
+# are multi-scale by nature, this is learning the powerbanks without explicit
+# preprocessing and its also a STRICT SUPERSET of CTNet (EEGNet style) embeddings
+# 
+# Being L the kernel length (temporal samples) and Fs the sampling frequency of
+# the EEG signal, Period = L / Fs. If we want to capture the different waves
+# atleast multiple periods of that wave has to be captured (1-3 periods). Kernel
+# of size 3 will capture 12 ms (At Fs=250hz, each time sample is 4 ms), 
+# then it will be able to capture fast gammas 100hz for example. Long filters will
+# detect low frequencies and short filters will detect high frequencies. Obviously 
+# large kernels can detect all as we said its a strict superset. Using smaller
+# filters ,in addition, which add almost no weights to CNN and can enhance wave detection
+# can be benefitial 
+#  
+# Delta waves 0.5-4 hz (Long kernel size!: 125)
+# Theta waves 4-7 hz  (63)
+# Alpha waves 8-12 hz (31)
+# Beta waves 12 - 30hz (7 - 15)
+# Gamma waves 30 - 100 hz (Short kernel size!: 3)
+
+# It should be researched which kernel sizes and which filters per scale is optimum for eeg
+# -------------------------------------------------------------------------
+
+def MultiScalePatchEmbedding(
+    x,
+    Chans, 
+    kernel_sizes=(5, 12, 25, 64 ,125),
+    filters_per_scale=(8, 16, 16, 16, 4),
+    pool_size=8, 
+    final_dropout=0.3,
+    spatial_dropout=0.1,
+):
+    branches = []
+    for k, f in zip(kernel_sizes, filters_per_scale):
+        b = Conv2D(f, (1, k), padding="same", use_bias=False)(x)
+        b = BatchNormalization()(b)
+        # Activation only after normalization avoids distortion of distrib. and stability
+        b = Activation("elu")(b)
+        branches.append(b)
+
+    # Form a complex representation 
+    x = Concatenate(axis=-1)(branches)
+
+    # Spatial Filtering (Channels)
+    x = DepthwiseConv2D((Chans, 1), use_bias=False)(x)
+    x = BatchNormalization()
+    x = Activation("elu")(x)
+
+    x = SpatialDropout2D(spatial_dropout)(x)
+
+    # Tokenization: Temporal Pooling into patches (B, T, D)
+    x = AveragePooling2D((1, pool_size))(x)
+    x = Dropout(final_dropout)(x)
+    x = Reshape((-1, x.shape[-1]))(x)
+    return x 
+
+
+# -------------------------------------------------------------------------
+# CrossAttentionFusion
+#
+# Purpose:
+#   Fuse temporal and spatial (channel-wise) representations using
+#   cross-attention. Temporal tokens act as queries, while channel tokens
+#   provide keys and values. Uses skip connection to stabilize training
+#
+# Intuition:
+#   "For this time segment, which spatial EEG patterns are relevant?"
+#   "TIME QUERIES channel"
+#
+# Inputs:
+#   time_x : (B, T, D)  - temporal patch embeddings
+#   chan_x : (B, C, D)  - channel/spatial embeddings
+#
+# Output:
+#   (B, T, D) - temporally-aligned features enriched with spatial context
+# -------------------------------------------------------------------------
+def CrossAttentionFusion(
+    time_x,
+    chan_x,
+    emb_size,
+    heads, 
+    dropout=0.1
+):
+    fused = MultiHeadAttention(
+        num_heads=heads,
+        key_dim=emb_size // heads,
+        dropout=dropout
+    )(
+        query=time_x,
+        key=chan_x,
+        value=chan_x
+    )
+
+    # Residual connection preserves temporal identity
+    # and stabilizes training
+    return Add()([time_x, fused])
+
+# The proposed Dual-Axis EEG Conformer explicitly models both temporal and channel-wise dependencies via axis-aware self-attention
+# followed by cross-attention fusion, leading to improved representational capacity over CTNet
+# This is in fact a refinement of CTNet and EEGConformer by building new layers on top of it, with stronger INDUCTIVE BIASES
+# 1) multi-scale temporal CNN (e.g. 3, 7, 15, 31, 63, 125) to capture theta/alpha/beta bands better
+# 2) Apply spatial CNN (electrodes correlations) AFTER temporal CNN (neurological inductive bias). LATE FUSION OF CNN + TRANSFORMER
+# 3) Apply transformer attention computation to EEG channels too, so TemporalTransformer and ChannelTransformer are needed (2)
+# 4) Cross attention fusion of the 2 Temporal/Channel encodings to allow capturing attention in channels too
+# 5) Improve pooling mechanisms (learnable pooling + global pooling at the end)
+# 6) Attention regularization || At A - I || 
+
+# The architecture can be summarized as:
+# 1. Multi-scale CNN Patch Embedding
+# 2. Temporal Transformer self-att
+# 3. Channel Transformer self-att
+# 4. Cross-Attention fusion of Channel/Temporal embeddings
+# 5. Attention pooling 
+# 6. Classification head
+
+# TODO: Improve positional embedding (Frequency aware with bias variable?)
+
+def DualAttentionEEGConformer(
     nb_classes,
     Chans = 64,
     Samples = 256,
@@ -605,4 +787,18 @@ def MindReaderNet(
     att_drop_prob=0.5
     # TODO : add more hyperparameters
 ) -> Model:
-    pass 
+    inp = Input((Chans, Samples, 1))
+
+    tokens = MultiScalePatchEmbedding(inp, Chans, emb_size)
+
+    time_feat = TemporalEncoder(tokens, depth, emb_size, heads)
+    chan_feat = ChannelEncoder(tokens, Chans, emb_size, depth, heads)
+
+    fused = CrossAttentionFusion(time_feat, chan_feat, emb_size, heads)
+
+    x = LayerNormalization()(fused)
+    x = GlobalAveragePooling1D()(x)
+    x = Dropout(0.5)(x)
+    out = Dense(nb_classes, activation="softmax")(x)
+
+    return Model(inp, out)
