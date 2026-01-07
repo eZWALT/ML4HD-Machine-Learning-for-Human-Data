@@ -3,9 +3,9 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer 
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import  LSTM, GRU
-from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
+from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape, Permute
 from tensorflow.keras.layers import Input, Flatten, Dense, Activation, Dropout
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D, GlobalAveragePooling1D
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D, GlobalAveragePooling1D, GlobalMaxPooling1D
 from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D, SpatialDropout2D
 from tensorflow.keras.layers import BatchNormalization, LayerNormalization, Add, MultiHeadAttention
 from tensorflow.keras.constraints import max_norm
@@ -547,6 +547,18 @@ def PositionalEncoding(x, seq_len, emb_size, drop_rate=0.1):
 
 ############ COMMON MODULES
 
+# From the original paper: The results show that our model is insensitive to the depth and head number of the self-attention module while processing EEG data
+# From the original paper: We design a novel visualization based on class activation mapping and topography to illustrate how the model learns essential features from a global perspective.
+# preprocessing of paper:  
+"""
+s. Without introducing additional task-dependent prior
+knowledge, we only use a few steps to pre-process the raw
+EEG data. First, band-pass filtering is employed to filter out
+extraneous high and low-frequency noise. Here, we use a
+6-order Chebyshev filter to preserve task-relevant rhythms.
+Then, a Z-score standardization is performed to reduce the
+fluctuation and nonstationarity
+"""
 def EEGConformer(
     nb_classes,
     Chans = 64,
@@ -701,7 +713,7 @@ def MultiScalePatchEmbedding(
 
     # Spatial Filtering (Channels)
     x = DepthwiseConv2D((Chans, 1), use_bias=False)(x)
-    x = BatchNormalization()
+    x = BatchNormalization()(x)
     x = Activation("elu")(x)
 
     x = SpatialDropout2D(spatial_dropout)(x)
@@ -798,8 +810,6 @@ def DualAttentionEEGConformer(
     # 0. Raw EEG signal, NumChannels * Time samples
     inp = Input((Chans, Samples, 1))
 
-    # TODO: Do we need any reshaping? 
-
     # 1. Multi-scale CNN Patch Tokens
     tokens = MultiScalePatchEmbedding(
         inp, Chans, 
@@ -809,9 +819,10 @@ def DualAttentionEEGConformer(
         patch_spatial_droprate,
         patch_final_droprate,
     )
-
+    # Analogous to ViT, add linear projection layer to avoid shape issues
+    # the shape of the token depends on the sum of filters per scale
+    tokens = Dense(emb_size, use_bias=False)(tokens)
     # Scale embeddings (standard transformer trick apparently)
-    # TODO: Does this make sense to add?
     tokens = tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
     # 2. Add Positional encoding to patch embeddings 
@@ -828,7 +839,7 @@ def DualAttentionEEGConformer(
     # what is the size of the tokens?????? depends on the number of kernels right? 
     # here some pooling or dense layer should be added to perform dimensionality reduction 
 
-    # 3. Temporal Transformer self-attention 
+    # 3. Temporal Transformer self-attention (B, T, D)
     time_embeddings = TransformerEncoder(
         tokens,
         emb_size=emb_size,
@@ -836,16 +847,23 @@ def DualAttentionEEGConformer(
         num_heads=time_num_heads,
         att_drop=time_att_droprate,
     ) 
-    # 4. Channel Transformer self-attention (Key contribution)
+    # 4. Channel Transformer self-attention 
+    # TODO: Solve this mess of channel embeddings  
+    channel_embeddings = Permute((2, 1))(tokens)
+
     channel_embeddings = TransformerEncoder(
-        tokens,
+        channel_embeddings,
         emb_size=emb_size,
         num_layers=chan_num_layers,
         num_heads=chan_num_heads,
         att_drop=chan_att_droprate,
     )
+    # Bring back to (B, T, D) for fusion
+    channel_embeddings = Permute((2, 1))(channel_embeddings)
 
 
+    # TODO: Cross-attention is incorrect because both embeddings shapes
+    # are different time_x: (B, T, D) chan_x: (B, C, D)
     # 5. Cross-Attention fusion of Channel/Temporal embeddings
     x = CrossAttentionFusion(
         time_embeddings, channel_embeddings, 
@@ -854,14 +872,20 @@ def DualAttentionEEGConformer(
         dropout=cross_att_droprate,
     )
 
-    # TODO: Should we add skip connections after attention layers?!??! good idea?
     x = Add()([tokens, x])
 
     # 6. Cross-Attention pooling 
     x = LayerNormalization()(x)
-    # TODO: Do we need an activation function here and after attention layers?!?!?
-    x = GlobalAveragePooling1D()(x)
+    # GAP its okay but we could change it for attention pooling 
+    # or pyramid pooling like presented below (presence + saliency)
+    avg = GlobalAveragePooling1D()(x)
+    max = GlobalMaxPooling1D()(x)
+    x = Concatenate()([avg, max])
+
     x = Dropout(pool_droprate)(x)
+    # Attention pooling
+    #a = Dense(1, activation="softmax")(x)  # (B, T, 1)
+    #x = tf.reduce_sum(a * x, axis=1) # (B, D)
     
     # 7. Classification head (Returns logits)
     out = ClassificationHead(
