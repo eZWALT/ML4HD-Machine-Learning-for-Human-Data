@@ -5,7 +5,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import  LSTM, GRU
 from tensorflow.keras.layers import Conv1D, MaxPool1D, Add, Concatenate, Reshape
 from tensorflow.keras.layers import Input, Flatten, Dense, Activation, Dropout
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, AveragePooling1D, GlobalAveragePooling1D
 from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D, SpatialDropout2D
 from tensorflow.keras.layers import BatchNormalization, LayerNormalization, Add, MultiHeadAttention
 from tensorflow.keras.constraints import max_norm
@@ -763,42 +763,114 @@ def CrossAttentionFusion(
 # 5) Improve pooling mechanisms (learnable pooling + global pooling at the end)
 # 6) Attention regularization || At A - I || 
 
-# The architecture can be summarized as:
-# 1. Multi-scale CNN Patch Embedding
-# 2. Temporal Transformer self-att
-# 3. Channel Transformer self-att
-# 4. Cross-Attention fusion of Channel/Temporal embeddings
-# 5. Attention pooling 
-# 6. Classification head
-
 # TODO: Improve positional embedding (Frequency aware with bias variable?)
-
 def DualAttentionEEGConformer(
+    # Basic
     nb_classes,
-    Chans = 64,
-    Samples = 256,
-    n_filters_time=40, 
-    filter_time_length=25,
-    pool_time_length=75,
-    pool_time_stride=15,
-    drop_prob=0.5,
-    num_layers=6,
-    num_heads=10,
-    att_drop_prob=0.5
-    # TODO : add more hyperparameters
+    Chans=64,
+    Samples=256,
+    emb_size=40,
+    # CNN Patches 
+    patch_kernel_sizes=(5, 12, 25, 64 ,125),
+    patch_filters_per_scale=(8, 16, 16, 16, 4),
+    patch_spatial_droprate=0.3,
+    patch_final_droprate=0.1,
+    patch_pool_size=8,
+    # Positional encoding 
+    pe_droprate=0.1,
+    # Self-Attention Transformers
+    time_num_heads=8,
+    chan_num_heads=8,
+    time_num_layers=4,
+    chan_num_layers=4,
+    time_att_droprate=0.1,
+    chan_att_droprate=0.1,
+    # Cross-Attention Transformer 
+    cross_num_heads=8,
+    cross_att_droprate=0.1,
+    # Final Pooling
+    pool_droprate=0.4,
+    # Classification Head & Pooling
+    classif_hidden_units=(128, 32),
+    classif_droprate_probs=(0.4, 0.2),    
 ) -> Model:
+
+    # 0. Raw EEG signal, NumChannels * Time samples
     inp = Input((Chans, Samples, 1))
 
-    tokens = MultiScalePatchEmbedding(inp, Chans, emb_size)
+    # TODO: Do we need any reshaping? 
 
-    time_feat = TemporalEncoder(tokens, depth, emb_size, heads)
-    chan_feat = ChannelEncoder(tokens, Chans, emb_size, depth, heads)
+    # 1. Multi-scale CNN Patch Tokens
+    tokens = MultiScalePatchEmbedding(
+        inp, Chans, 
+        patch_kernel_sizes,
+        patch_filters_per_scale,
+        patch_pool_size,
+        patch_spatial_droprate,
+        patch_final_droprate,
+    )
 
-    fused = CrossAttentionFusion(time_feat, chan_feat, emb_size, heads)
+    # Scale embeddings (standard transformer trick apparently)
+    # TODO: Does this make sense to add?
+    tokens = tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
-    x = LayerNormalization()(fused)
+    # 2. Add Positional encoding to patch embeddings 
+    # TODO: Does this make sense to add?
+    seq_len = tokens.shape[1]
+    tokens = PositionalEncoding(
+        tokens,
+        seq_len=seq_len,
+        emb_size=emb_size,
+        drop_rate=pe_droprate,
+    )
+
+    # TODO: Check the shapes of embeddings and tokens they are mismatched right now
+    # what is the size of the tokens?????? depends on the number of kernels right? 
+    # here some pooling or dense layer should be added to perform dimensionality reduction 
+
+    # 3. Temporal Transformer self-attention 
+    time_embeddings = TransformerEncoder(
+        tokens,
+        emb_size=emb_size,
+        num_layers=time_num_layers,
+        num_heads=time_num_heads,
+        att_drop=time_att_droprate,
+    ) 
+    # 4. Channel Transformer self-attention (Key contribution)
+    channel_embeddings = TransformerEncoder(
+        tokens,
+        emb_size=emb_size,
+        num_layers=chan_num_layers,
+        num_heads=chan_num_heads,
+        att_drop=chan_att_droprate,
+    )
+
+
+    # 5. Cross-Attention fusion of Channel/Temporal embeddings
+    x = CrossAttentionFusion(
+        time_embeddings, channel_embeddings, 
+        emb_size=emb_size, 
+        heads=cross_num_heads,
+        dropout=cross_att_droprate,
+    )
+
+    # TODO: Should we add skip connections after attention layers?!??! good idea?
+    x = Add()([tokens, x])
+
+    # 6. Cross-Attention pooling 
+    x = LayerNormalization()(x)
+    # TODO: Do we need an activation function here and after attention layers?!?!?
     x = GlobalAveragePooling1D()(x)
-    x = Dropout(0.5)(x)
-    out = Dense(nb_classes, activation="softmax")(x)
+    x = Dropout(pool_droprate)(x)
+    
+    # 7. Classification head (Returns logits)
+    out = ClassificationHead(
+        x,
+        nb_classes=nb_classes,
+        hidden_units=classif_hidden_units,
+        drop_probs=classif_droprate_probs, 
+        activation="elu",
+        use_batchnorm=False
+    )
 
     return Model(inp, out)
