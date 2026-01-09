@@ -13,28 +13,25 @@ from tensorflow.keras import backend as K
 from tensorflow.keras.regularizers import l2
 
 
-def Simple_CNN(nb_classes, input_shape=(64, 128, 1)):
-        
-    input1 = Input(shape =input_shape)
-    block1 = Conv2D(32, (3, 3), activation='elu', padding='same')(input1)
-    block1 = BatchNormalization()(block1)
-    block1 = MaxPooling2D((2, 1))(block1) # Only reduce height, keep time width
+from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, MaxPooling2D, Flatten, Dense, Dropout, Activation, GlobalAveragePooling2D
+from tensorflow.keras.models import Model
 
-    # 2. Second Convolutional Block
-    block2 = Conv2D(64, (3, 3), activation='elu', padding='same')(block1)
-    block2 = BatchNormalization()(block2)
-    block2 = MaxPooling2D((2, 1))(block2)
-
-    # 3. Flatten and Classify
-    block3 = Flatten()(block2)
-    block3 = Dense(64, activation='elu')(block3)
-    block3 = Dropout(0.5)(block3) # Prevent overfitting
-
-    dense = Dense(nb_classes)(block3)
- 
-    softmax = Activation('softmax')(dense)
+def Simple_CNN(nb_classes, input_shape=(36, 3, 1)):
+    input1 = Input(shape=input_shape)
     
-    return Model(inputs=input1, outputs=softmax)
+    # Use larger kernels since the "image" is tiny
+    x = Conv2D(32, (3, 3), activation='elu', padding='same')(input1)
+    x = BatchNormalization()(x)
+    
+    x = Conv2D(64, (3, 3), activation='elu', padding='same')(x)
+    x = BatchNormalization()(x)
+
+    x = Flatten()(x) # Flatten is better than GlobalAverage for tiny inputs
+    x = Dense(128, activation='elu')(x)
+    x = Dropout(0.5)(x)
+    
+    outputs = Dense(nb_classes, activation='softmax')(x)
+    return Model(inputs=input1, outputs=outputs)
 
 
 def Simple_LSTM(nb_classes, input_shape=(3, 187)):
