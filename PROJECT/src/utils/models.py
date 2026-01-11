@@ -705,20 +705,22 @@ def MultiScalePatchEmbedding(
         b = Activation("elu")(b)
         branches.append(b)
 
-    # Form a complex representation 
+    # Concatenate along channel dimension. shape: (B, Chans, T, sum(filters_per_scale))
     x = Concatenate(axis=-1)(branches)
 
-    # Spatial Filtering (Channels)
-    x = DepthwiseConv2D((Chans, 1), use_bias=False)(x)
+    # Spatial Filtering ( Across Channels)
+    x = Conv2D(x.shape[-1], (Chans, 1), padding="valid", use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
-
     x = SpatialDropout2D(spatial_dropout)(x)
 
-    # Tokenization: Temporal Pooling into patches (B, T, D)
+    # Tokenization: Temporal Pooling into patches (B, num_tokens, sum(filters_per_scale))
+
     x = AveragePooling2D((1, pool_size))(x)
     x = Dropout(final_dropout)(x)
-    x = Reshape((-1, x.shape[-1]))(x)
+    B, H, T, C = tf.unstack(tf.shape(x))
+    x = tf.reshape(x, (B, T, C))
+
     return x 
 
 
@@ -770,7 +772,7 @@ def DualAttentionEEGConformer(
     inp = Input((Chans, Samples, 1))
 
     # 1. Multi-scale CNN Patch Tokens
-    tokens = MultiScalePatchEmbedding(
+    time_tokens = MultiScalePatchEmbedding(
         inp, Chans, 
         patch_kernel_sizes,
         patch_filters_per_scale,
@@ -784,19 +786,24 @@ def DualAttentionEEGConformer(
     # Analogous to ViT, add linear projection layer to avoid shape issues
     # the shape of the token depends on the sum of filters per scale
 
-    tokens = Dense(emb_size, use_bias=False)(tokens)
+    time_tokens = Dense(emb_size, use_bias=False)(time_tokens)
     # Scale embeddings (standard transformer trick)
-    tokens = tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
+    time_tokens = time_tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
     # 2. Add Positional encoding to patch embeddings 
     # TODO: Does this make sense to add?
-    seq_len = tokens.shape[1]
-    tokens = PositionalEncoding(
-        tokens,
+    seq_len = tf.shape(time_tokens)[1]
+    time_tokens = PositionalEncoding(
+        time_tokens,
         seq_len=seq_len,
         emb_size=emb_size,
         drop_rate=pe_droprate,
     )
+
+    # TODO: This is too simplistic change it
+    # 3. Channel tokens (average over time + linear projection)
+    chan_tokens = tf.reduce_mean(inp, axis=2)  # (B, Chans, 1)
+    chan_tokens = Dense(emb_size)(chan_tokens)  # (B, Chans, emb_size)
 
     # TODO: Check the shapes of embeddings and tokens they are mismatched right now
     # what is the size of the tokens?????? depends on the number of kernels right? 
@@ -804,32 +811,25 @@ def DualAttentionEEGConformer(
 
     # 3. Temporal Transformer self-attention (B, T, D)
     time_embeddings = TransformerEncoder(
-        tokens,
+        time_tokens,
         emb_size=emb_size,
         num_layers=time_num_layers,
         num_heads=time_num_heads,
         att_drop=time_att_droprate,
     ) 
-
-    # TODO: Solve this mess of channel embeddings  
-    channel_embeddings = Permute((2, 1))(tokens)
     
     # 4. Channel Transformer self-attention 
     channel_embeddings = TransformerEncoder(
-        channel_embeddings,
+        chan_tokens,
         emb_size=emb_size,
         num_layers=chan_num_layers,
         num_heads=chan_num_heads,
         att_drop=chan_att_droprate,
     )
-    # Bring back to (B, T, D) for fusion
-    channel_embeddings = Permute((2, 1))(channel_embeddings)
-
-
-    # TODO: Cross-attention is incorrect because both embeddings shapes
-    # are different time_x: (B, T, D) chan_x: (B, C, D)
 
     # 5. Cross-Attention fusion of Channel/Temporal embeddings
+    # PRE-LN 
+    #time_embeddings = LayerNormalization()(time_embeddings)
     time_fused = MultiHeadAttention(
         num_heads=cross_time_num_heads,
         key_dim=emb_size // cross_time_num_heads,
@@ -839,7 +839,8 @@ def DualAttentionEEGConformer(
         key=channel_embeddings,
         value=channel_embeddings
     )
-
+    time_embeddings = Add()([time_embeddings, time_fused])
+    time_embeddings = LayerNormalization()(time_embeddings)
 
     channel_fused = MultiHeadAttention(
         num_heads=cross_chan_num_heads,
@@ -847,18 +848,21 @@ def DualAttentionEEGConformer(
         dropout=cross_chan_att_droprate,
     )
 
-    x = Add()([time_fused, channel_fused, tokens])
+    channel_embeddings = Add()([channel_embeddings, channel_fused])
+    channel_embeddings = LayerNormalization()(channel_embeddings)
 
     # 6. Cross-Attention pooling 
-    x = LayerNormalization()(x)
 
-    # GAP its okay but we could change it for attention pooling 
-    # or pyramid pooling like presented below (presence + saliency)
-    avg = GlobalAveragePooling1D()(x)
-    max = GlobalMaxPooling1D()(x)
+    # We use the average and max to try to capture (presence + saliency)
+    # for both temporal and spatial channel embeddings
+    time_avg = GlobalAveragePooling1D()(time_embeddings)
+    time_max = GlobalMaxPooling1D()(time_embeddings)
 
-    x = Concatenate()([avg, max])
+    chan_avg = GlobalAveragePooling1D()(channel_embeddings)
+    chan_max = GlobalAveragePooling1D()(channel_embeddings)
 
+    x = Concatenate()([time_avg, time_max, chan_avg, chan_max])
+    # Apply a big droprate
     x = Dropout(pool_droprate)(x)
 
     # 7. Classification head (Returns logits)
