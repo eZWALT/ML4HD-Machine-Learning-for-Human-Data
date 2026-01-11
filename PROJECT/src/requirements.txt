@@ -1,5 +1,6 @@
 polars
 pandas
+loguru 
 ipykernel
 notebook
 matplotlib
@@ -8,5 +9,7 @@ scikit-learn
 tensorflow
 mne 
 moabb
-braindecode
-statsmodels
+tensorflow 
+scipy
+xgboost
+lightgbm

@@ -722,46 +722,6 @@ def MultiScalePatchEmbedding(
     return x 
 
 
-# -------------------------------------------------------------------------
-# CrossAttentionFusion
-#
-# Purpose:
-#   Fuse temporal and spatial (channel-wise) representations using
-#   cross-attention. Temporal tokens act as queries, while channel tokens
-#   provide keys and values. Uses skip connection to stabilize training
-#
-# Intuition:
-#   "For this time segment, which spatial EEG patterns are relevant?"
-#   "TIME QUERIES channel"
-#
-# Inputs:
-#   time_x : (B, T, D)  - temporal patch embeddings
-#   chan_x : (B, C, D)  - channel/spatial embeddings
-#
-# Output:
-#   (B, T, D) - temporally-aligned features enriched with spatial context
-# -------------------------------------------------------------------------
-def CrossAttentionFusion(
-    time_x,
-    chan_x,
-    emb_size,
-    heads, 
-    dropout=0.1
-):
-    fused = MultiHeadAttention(
-        num_heads=heads,
-        key_dim=emb_size // heads,
-        dropout=dropout
-    )(
-        query=time_x,
-        key=chan_x,
-        value=chan_x
-    )
-
-    # Residual connection preserves temporal identity
-    # and stabilizes training
-    return Add()([time_x, fused])
-
 # The proposed Dual-Axis EEG Conformer explicitly models both temporal and channel-wise dependencies via axis-aware self-attention
 # followed by cross-attention fusion, leading to improved representational capacity over CTNet
 # This is in fact a refinement of CTNet and EEGConformer by building new layers on top of it, with stronger INDUCTIVE BIASES
@@ -795,8 +755,10 @@ def DualAttentionEEGConformer(
     time_att_droprate=0.1,
     chan_att_droprate=0.1,
     # Cross-Attention Transformer 
-    cross_num_heads=8,
-    cross_att_droprate=0.1,
+    cross_time_num_heads=8,
+    cross_time_att_droprate=0.1,
+    cross_chan_num_heads=8,
+    cross_chan_att_droprate=0.1,
     # Final Pooling
     pool_droprate=0.4,
     # Classification Head & Pooling
@@ -816,10 +778,14 @@ def DualAttentionEEGConformer(
         patch_spatial_droprate,
         patch_final_droprate,
     )
+    # Maybe an assertion of sum of filters >= embedding size could be useful here
+    #assert(sum(patch_filters_per_scale) >= emb_size)
+
     # Analogous to ViT, add linear projection layer to avoid shape issues
     # the shape of the token depends on the sum of filters per scale
+
     tokens = Dense(emb_size, use_bias=False)(tokens)
-    # Scale embeddings (standard transformer trick apparently)
+    # Scale embeddings (standard transformer trick)
     tokens = tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
     # 2. Add Positional encoding to patch embeddings 
@@ -844,10 +810,11 @@ def DualAttentionEEGConformer(
         num_heads=time_num_heads,
         att_drop=time_att_droprate,
     ) 
-    # 4. Channel Transformer self-attention 
+
     # TODO: Solve this mess of channel embeddings  
     channel_embeddings = Permute((2, 1))(tokens)
-
+    
+    # 4. Channel Transformer self-attention 
     channel_embeddings = TransformerEncoder(
         channel_embeddings,
         emb_size=emb_size,
@@ -861,29 +828,39 @@ def DualAttentionEEGConformer(
 
     # TODO: Cross-attention is incorrect because both embeddings shapes
     # are different time_x: (B, T, D) chan_x: (B, C, D)
+
     # 5. Cross-Attention fusion of Channel/Temporal embeddings
-    x = CrossAttentionFusion(
-        time_embeddings, channel_embeddings, 
-        emb_size=emb_size, 
-        heads=cross_num_heads,
-        dropout=cross_att_droprate,
+    time_fused = MultiHeadAttention(
+        num_heads=cross_time_num_heads,
+        key_dim=emb_size // cross_time_num_heads,
+        dropout=cross_time_att_droprate
+    )(
+        query=time_embeddings,
+        key=channel_embeddings,
+        value=channel_embeddings
     )
 
-    x = Add()([tokens, x])
+
+    channel_fused = MultiHeadAttention(
+        num_heads=cross_chan_num_heads,
+        key_dim=emb_size // cross_chan_num_heads, 
+        dropout=cross_chan_att_droprate,
+    )
+
+    x = Add()([time_fused, channel_fused, tokens])
 
     # 6. Cross-Attention pooling 
     x = LayerNormalization()(x)
+
     # GAP its okay but we could change it for attention pooling 
     # or pyramid pooling like presented below (presence + saliency)
     avg = GlobalAveragePooling1D()(x)
     max = GlobalMaxPooling1D()(x)
+
     x = Concatenate()([avg, max])
 
     x = Dropout(pool_droprate)(x)
-    # Attention pooling
-    #a = Dense(1, activation="softmax")(x)  # (B, T, 1)
-    #x = tf.reduce_sum(a * x, axis=1) # (B, D)
-    
+
     # 7. Classification head (Returns logits)
     out = ClassificationHead(
         x,
