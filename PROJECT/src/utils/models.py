@@ -1,4 +1,5 @@
 from typing import List
+import math
 import tensorflow as tf
 from tensorflow.keras.layers import Layer 
 from tensorflow.keras.models import Model
@@ -11,6 +12,9 @@ from tensorflow.keras.layers import BatchNormalization, LayerNormalization, Add,
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras import backend as K
 from tensorflow.keras.regularizers import l2
+
+# This should be illegal
+from einops.layers.keras import Rearrange
 
 
 from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, MaxPooling2D, Flatten, Dense, Dropout, Activation, GlobalAveragePooling2D
@@ -241,7 +245,6 @@ def ShallowConvNet(nb_classes, Chans = 64, Samples = 128, dropoutRate = 0.5):
 def Inception(nb_classes, Chans = 64, Samples = 256):
    
     input_main = Input(shape=(Chans,Samples)) # (None, 301, 19)
-    print(input_main.shape)
     block1       = Inception_module(
                     input_tensor=input_main,
                     bottleneck_size=nb_classes*3
@@ -404,81 +407,93 @@ def PatchEmbedding(
 def CTNetPatchEmbedding(
     x,
     n_chans,
-    emb_size=40,
-    kernel_size=64,
+    n_filters_time=20,
     depth_multiplier=2,
+    kernel_size=64,
     pool_size_1=8,
     pool_size_2=8,
     drop_rate=0.3,
 ):
-    # Temporal conv 
+    emb_size = n_filters_time * depth_multiplier
+
+    # Temporal conv
+    # Shape: (batch, T, C, 1) -> (batch, T, C, n_filters_time)
     x = Conv2D(
-        emb_size // 2,
+        n_filters_time,
         (1, kernel_size),
         padding="same",
         use_bias=False,
+        data_format="channels_last",
     )(x)
-    x = BatchNormalization()(x)
+    x = BatchNormalization(axis=-1)(x)
 
-    # Spatial filtering (Depthwise)
+    # Depthwise spatial conv
+    # Shape: (batch, T, C, n_filters_time) -> (batch, T, 1, emb_size)
     x = Conv2D(
-        (emb_size // 2) * depth_multiplier,
+        emb_size,
         (n_chans, 1),
-        groups=emb_size // 2,
+        groups=n_filters_time,
         use_bias=False,
+        data_format="channels_last",
     )(x)
-    x = BatchNormalization()(x)
+    x = BatchNormalization(axis=-1)(x)
     x = Activation("elu")(x)
 
-    x = AveragePooling2D((1, pool_size_1))(x)
-    x = Dropout(drop_rate)(x)
 
-    # Refinement
+    x = AveragePooling2D(
+        (1, pool_size_1),
+        data_format="channels_last",
+    )(x)
+    x = Dropout(drop_rate)(x)
+    # Refinement conv
     x = Conv2D(
         emb_size,
         (1, 16),
         padding="same",
         use_bias=False,
+        data_format="channels_last",
     )(x)
-    x = BatchNormalization()(x)
+
+    x = BatchNormalization(axis=-1)(x)
     x = Activation("elu")(x)
 
-    x = AveragePooling2D((1, pool_size_2))(x)
+    x = AveragePooling2D(
+        (1, pool_size_2),
+        data_format="channels_last",
+    )(x)
+
     x = Dropout(drop_rate)(x)
 
-    # tokens
-    x = Reshape((-1, emb_size))(x)
+    # Flatten spatial dimensions for Transformer
+    # Current shape: (batch, T_new, H, D) -> flatten H*T_new to sequence
+    x = Rearrange("batch time h channels -> batch (time h) channels")(x)
     return x
-
 
 def TransformerEncoderBlock(
-    x, 
+    x,
     emb_size,
     num_heads,
-    att_drop=0.5,
+    drop_prob=0.5,
     ff_expansion=4,
-): 
-    # --- SELF ATTENTION ---
-    x_norm = LayerNormalization(epsilon=1e-6)(x)
-    attn = MultiHeadAttention(
+):
+    # Attention
+    attn = tf.keras.layers.MultiHeadAttention(
         num_heads=num_heads,
         key_dim=emb_size // num_heads,
-        dropout=att_drop,
-    )(x_norm, x_norm)
-    # Dropout + skip connection
-    attn = Dropout(att_drop)(attn)
-    x = Add()([x, attn])
+        dropout=drop_prob,
+    )(x, x)
+    x = Add()([x, Dropout(drop_prob)(attn)])
+    x = LayerNormalization(epsilon=1e-6)(x)
 
-    # --- FEED FROWARD ---
-    x_norm = LayerNormalization(epsilon=1e-6)(x)
-    ff = Dense(ff_expansion * emb_size, activation="gelu")(x_norm)
-    # 2 dense layers, dropout + skip connection
-    ff = Dropout(att_drop)(ff)
+    # Feed-forward
+    ff = Dense(ff_expansion * emb_size, activation="gelu")(x)
+    ff = Dropout(drop_prob)(ff)
     ff = Dense(emb_size)(ff)
-    ff = Dropout(att_drop)(ff)
-    x = Add()([x, ff]) 
-    
+
+    x = Add()([x, Dropout(drop_prob)(ff)])
+    x = LayerNormalization(epsilon=1e-6)(x)
     return x
+
 
 def TransformerEncoder(
         x, 
@@ -492,7 +507,7 @@ def TransformerEncoder(
             x, 
             emb_size=emb_size,
             num_heads=num_heads,
-            att_drop=att_drop,
+            drop_prob=att_drop,
         )
     return x 
 
@@ -532,16 +547,25 @@ def ClassificationHead(
     return Dense(nb_classes, activation="softmax")(x)
 
 
-def PositionalEncoding(x, seq_len, emb_size, drop_rate=0.1):
-    pos_emb = tf.Variable(
-        initial_value=tf.random.normal((1, seq_len, emb_size)),
-        trainable=True,
-        name="pos_embedding",
-    )
-    x = x + pos_emb[:, :tf.shape(x)[1], :]
-    return Dropout(drop_rate)(x)
-    
+class PositionalEncoding(tf.keras.layers.Layer):
+    def __init__(self, max_len, emb_size, drop_rate):
+        super().__init__()
+        self.pos_emb = self.add_weight(
+            shape=(1, max_len, emb_size),
+            initializer="random_normal",
+            trainable=True,
+        )
+        self.drop = Dropout(drop_rate)
 
+    def call(self, x):
+        x = tf.convert_to_tensor(x) 
+        seq_len = tf.shape(x)[1]
+        return self.drop(x + self.pos_emb[:, :seq_len, :])
+    
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    
 ############ COMMON MODULES
 
 # From the original paper: The results show that our model is insensitive to the depth and head number of the self-attention module while processing EEG data
@@ -597,56 +621,58 @@ def EEGConformer(
     x = ClassificationHead(x, nb_classes, use_batchnorm=False)
     return Model(inputs=input_eeg, outputs=x)
 
+
+#################################################################################  
+
 def CTNet(
     nb_classes,
     Chans=64,
     Samples=256,
-    emb_size=40,
+    n_filters_time=20,
+    depth_multiplier=2,
+    kernel_size=64,
+    pool_size_1=8,
+    pool_size_2=8,
     num_heads=4,
     num_layers=6,
     cnn_drop_rate=0.3,
     attn_drop_rate=0.1,
     final_drop_rate=0.5,
-) -> Model:
+):
+    emb_size = n_filters_time * depth_multiplier
+    # (B, C, T, 1)
+    inputs = Input(shape=(Chans, Samples, 1))  
 
-    inputs = Input(shape=(Chans, Samples))
-
-    # (B, 1, C, T)
-    x = Reshape((1, Chans, Samples))(inputs)
-
-    # 1. CNN patch embedding (EEGNet style)
+    # CNN embedding
     cnn_tokens = CTNetPatchEmbedding(
-        x,
+        inputs,
         n_chans=Chans,
-        emb_size=emb_size,
+        n_filters_time=n_filters_time,
+        depth_multiplier=depth_multiplier,
+        kernel_size=kernel_size,
+        pool_size_1=pool_size_1,
+        pool_size_2=pool_size_2,
         drop_rate=cnn_drop_rate,
     )
 
-    # Scale embeddings (standard transformer trick apparently)
-    cnn_tokens = cnn_tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
-
-    # 2. Add Positional encoding to patch embeddings 
-    seq_len = cnn_tokens.shape[1]
+    seq_len = cnn_tokens.shape[1]  
     cnn_tokens = PositionalEncoding(
-        cnn_tokens,
-        seq_len=seq_len,
+        max_len=seq_len,
         emb_size=emb_size,
         drop_rate=attn_drop_rate,
-    )
+    )(cnn_tokens)
 
-    # 3. Transformer encoder embedding enhancement through attention 
+    # Transformer
     att_tokens = TransformerEncoder(
         cnn_tokens,
-        num_layers=num_layers, 
+        num_layers=num_layers,
         emb_size=emb_size,
         num_heads=num_heads,
-        att_drop=attn_drop_rate 
+        att_drop=attn_drop_rate,
     )
 
-    # 4. Skip connection embeddins (cnn + attention)
     features = Add()([cnn_tokens, att_tokens])
 
-    # 5. Classification 
     x = Flatten()(features)
     x = Dropout(final_drop_rate)(x)
     outputs = Dense(nb_classes, activation="softmax")(x)
@@ -690,10 +716,10 @@ def CTNet(
 
 def MultiScalePatchEmbedding(
     x,
-    Chans, 
-    kernel_sizes=(5, 12, 25, 64 ,125),
+    Chans,
+    kernel_sizes=(5, 12, 25, 64, 125),
     filters_per_scale=(8, 16, 16, 16, 4),
-    pool_size=8, 
+    pool_size=8,
     final_dropout=0.3,
     spatial_dropout=0.1,
 ):
@@ -701,27 +727,39 @@ def MultiScalePatchEmbedding(
     for k, f in zip(kernel_sizes, filters_per_scale):
         b = Conv2D(f, (1, k), padding="same", use_bias=False)(x)
         b = BatchNormalization()(b)
-        # Activation only after normalization avoids distortion of distrib. and stability
         b = Activation("elu")(b)
         branches.append(b)
 
-    # Concatenate along channel dimension. shape: (B, Chans, T, sum(filters_per_scale))
+    # (B, Chans, T, F_total)
     x = Concatenate(axis=-1)(branches)
 
-    # Spatial Filtering ( Across Channels)
-    x = Conv2D(x.shape[-1], (Chans, 1), padding="valid", use_bias=False)(x)
+    # CHANNEL TOKENS (PRE-SPATIAL-COLLAPSE (MIXING OF ELECTRODES)) 
+    # Average over time → each electrode has rich spectral features
+    chan_tokens = tf.reduce_mean(x, axis=2)          # (B, Chans, F_total)
+    chan_tokens = Dense(x.shape[-1], use_bias=False)(chan_tokens)
+
+    # TEMPORAL TOKENS
+    x = Conv2D(
+        x.shape[-1],
+        (Chans, 1),
+        padding="valid",
+        use_bias=False
+    )(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
     x = SpatialDropout2D(spatial_dropout)(x)
 
-    # Tokenization: Temporal Pooling into patches (B, num_tokens, sum(filters_per_scale))
-
     x = AveragePooling2D((1, pool_size))(x)
     x = Dropout(final_dropout)(x)
-    B, H, T, C = tf.unstack(tf.shape(x))
-    x = tf.reshape(x, (B, T, C))
 
-    return x 
+    # (B, T, F_total)
+    B = tf.shape(x)[0]
+    T = tf.shape(x)[2]
+    D = tf.shape(x)[3]
+    time_tokens = tf.reshape(x, (B, T, D))
+
+    return time_tokens, chan_tokens
+
 
 
 # The proposed Dual-Axis EEG Conformer explicitly models both temporal and channel-wise dependencies via axis-aware self-attention
@@ -791,23 +829,32 @@ def DualAttentionEEGConformer(
     time_tokens = time_tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
     # 2. Add Positional encoding to patch embeddings 
-    # TODO: Does this make sense to add?
-    seq_len = tf.shape(time_tokens)[1]
+    time_seq_len = time_tokens.shape[1]  
+    
     time_tokens = PositionalEncoding(
-        time_tokens,
-        seq_len=seq_len,
+        seq_len=time_seq_len,
         emb_size=emb_size,
         drop_rate=pe_droprate,
-    )
+    )(time_tokens)
+
 
     # TODO: This is too simplistic change it
     # 3. Channel tokens (average over time + linear projection)
     chan_tokens = tf.reduce_mean(inp, axis=2)  # (B, Chans, 1)
     chan_tokens = Dense(emb_size)(chan_tokens)  # (B, Chans, emb_size)
 
+    chan_seq_len = chan_tokens.shape[1]  
+    
+    chan_tokens = PositionalEncoding(
+        seq_len=chan_seq_len,
+        emb_size=emb_size,
+        drop_rate=pe_droprate,
+    )(chan_tokens)
+
     # TODO: Check the shapes of embeddings and tokens they are mismatched right now
     # what is the size of the tokens?????? depends on the number of kernels right? 
     # here some pooling or dense layer should be added to perform dimensionality reduction 
+
 
     # 3. Temporal Transformer self-attention (B, T, D)
     time_embeddings = TransformerEncoder(
