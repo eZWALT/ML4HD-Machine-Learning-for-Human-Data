@@ -725,6 +725,9 @@ def MultiScalePatchEmbedding(
     spatial_dropout=0.1,
     emb_size=40,
 ):
+    # Compute F_total deterministically
+    F_total = int(sum(filters_per_scale))
+
     # 1) MULTI-SCALE TEMPORAL CONVOLUTIONS (frequency-aware filters)
     branches = []
     for k, f in zip(kernel_sizes, filters_per_scale):
@@ -736,7 +739,6 @@ def MultiScalePatchEmbedding(
     # Concatenate all temporal scales
     # Shape: (B, Chans, Samples, F_total)
     x = Concatenate(axis=-1)(branches)
-    F_total = x.shape[-1]
 
     print("Time Tokens After temporal convolution: {}", x.shape)
 
@@ -745,37 +747,26 @@ def MultiScalePatchEmbedding(
     # ------------------------------------------------------------------
     # Now we are going to convolve and aggregate time so (B, C, X) and then 
     # with a final linear layer we down-project X -> emb_size
-    chan_tokens = Conv2D(
+    channel_embeddings = Conv2D(
         filters=F_total,
         kernel_size=(1, channel_temp_filter_size),
         strides=(1,2),
         padding="same",
         use_bias=False
     )(x)
-    chan_tokens = BatchNormalization()(chan_tokens)
-    chan_tokens = Activation("elu")(chan_tokens)
-    print("Channel tokens After FIRST CONVOLUTION: {}", chan_tokens.shape)
-
-    chan_tokens = Conv2D(
-        filters=F_total,
-        kernel_size=(1, channel_temp_filter_size),
-        strides=(1,2),
-        padding="same",
-        use_bias=False
-    )(chan_tokens)
-    chan_tokens = BatchNormalization()(chan_tokens)
-    chan_tokens = Activation("elu")(chan_tokens)
-    print("Channel tokens After SECOND CONVOLUTION: {}", chan_tokens.shape)
+    channel_embeddings = BatchNormalization()(channel_embeddings)
+    channel_embeddings = Activation("elu")(channel_embeddings)
+    print("Channel tokens After CONVOLUTION: {}", channel_embeddings.shape)
     #
     #  Flatten temporal + feature dimension: (B, C, X*F) for final projection
-    chan_tokens = Reshape((Chans, -1))(chan_tokens)
-    print("Channel tokens After flattening temporal + feature dims: {}", chan_tokens.shape)
+    channel_embeddings = Reshape((Chans, -1))(channel_embeddings)
+    print("Channel tokens After flattening temporal + feature dims: {}", channel_embeddings.shape)
 
     # shape: (B, Chans, emb_size), followed by normalization, no need to use bias
     # Analogous to ViT, add linear projection layer to avoid shape issues
     # the shape of the token depends on the sum of filters per scale
-    chan_tokens = Dense(emb_size, use_bias=False)(chan_tokens)
-    print("Channel tokens After DENSE: {}", chan_tokens.shape)
+    channel_embeddings = Dense(emb_size, use_bias=False)(channel_embeddings)
+    print("Channel tokens After DENSE: {}", channel_embeddings.shape)
 
 
     # ------------------------------------------------------------------
@@ -802,19 +793,19 @@ def MultiScalePatchEmbedding(
     # ------------------------------------------------------------------
     # 4) Reshape → Transformer tokens
     # ------------------------------------------------------------------
-    time_tokens = Reshape(
+    time_embeddings = Reshape(
         (-1, F_total),
         name="time_token_reshape",
     )(x)
 
-    time_tokens = Dense(
+    time_embeddings = Dense(
         emb_size,
         use_bias=False,
         name="time_projection",
-    )(time_tokens)
+    )(time_embeddings)
 
-    print("Time tokens After DENSE: {}", time_tokens.shape)
-    return time_tokens, chan_tokens
+    print("Time tokens After DENSE: {}", time_embeddings.shape)
+    return time_embeddings, channel_embeddings
 
 
 
@@ -826,9 +817,7 @@ def MultiScalePatchEmbedding(
 # 3) Apply transformer attention computation to EEG channels too, so TemporalTransformer and ChannelTransformer are needed (2)
 # 4) Cross attention fusion of the 2 Temporal/Channel encodings to allow capturing attention in channels too
 # 5) Improve pooling mechanisms (learnable pooling + global pooling at the end)
-# 6) Attention regularization || At A - I || 
 
-# TODO: Improve positional embedding (Frequency aware with bias variable?)
 def DualAttentionEEGConformer(
     # Basic
     nb_classes,
@@ -860,17 +849,29 @@ def DualAttentionEEGConformer(
     pool_droprate=0.4,
     # Classification Head & Pooling
     classif_hidden_units=(128, 32),
-    classif_droprate_probs=(0.4, 0.2),    
+    classif_droprate_probs=(0.4, 0.2),   
+    # Ablation flags
+    use_time_embeddings=True, 
+    use_channel_embeddings=True, 
+    use_cross_attention=True,
+    use_cross_channel_attention=True,
+    use_cross_time_attention=True,
+    use_positional_encoding=True, 
+    fusion_mode="gap+flatten", #options: flatten, gap, gap+flatten
 ) -> Model:
 
     # 0. Raw EEG signal: (Batch B, Channels C, TimeSamples T, 1) (convolution channel)
     inp = Input((Chans, Samples, 1))
 
     # Its better for the embedding representation (Bottleneck effect autoencoder)
-    assert(sum(patch_filters_per_scale) >= emb_size)
+    assert sum(patch_filters_per_scale) >= emb_size, "The sum of filters must be greater than the embedding size to produce a bottleneck!"
+    assert Samples % patch_pool_size == 0, \
+        f"Samples ({Samples}) must be divisible by patch_pool_size ({patch_pool_size})"
+    expected_time_seq_len = Samples // patch_pool_size
+    assert expected_time_seq_len > 0, "Time sequence length would be 0 after pooling"
 
     # 1. Multi-scale CNN Patch Tokens
-    time_tokens, chan_tokens = MultiScalePatchEmbedding(
+    time_embeddings, channel_embeddings = MultiScalePatchEmbedding(
         inp, Chans, 
         kernel_sizes=patch_kernel_sizes,
         filters_per_scale=patch_filters_per_scale,
@@ -881,80 +882,104 @@ def DualAttentionEEGConformer(
         emb_size=emb_size
     )
 
-    # 2. Add Positional encoding to patch embeddings 
-    time_seq_len = time_tokens.shape[1]  
-    chan_seq_len = chan_tokens.shape[1]  
+    # ABLATION: Disable tokens
+    if not use_time_embeddings:
+        time_embeddings = None 
+    if not use_channel_embeddings: 
+        channel_embeddings = None
 
-    time_tokens = PositionalEncoding(
-        max_len=time_seq_len,
-        emb_size=emb_size,
-        drop_rate=pe_droprate,
-    )(time_tokens)
+    # 2. Add Positional encoding to patch embeddings 
+    if use_positional_encoding:
+        if time_embeddings is not None:
+            time_seq_len = time_embeddings.shape[1]  
+            time_embeddings = PositionalEncoding(
+                max_len=time_seq_len,
+                emb_size=emb_size,
+                drop_rate=pe_droprate,
+            )(time_embeddings)
+        if channel_embeddings is not None: 
+            chan_seq_len = channel_embeddings.shape[1]
+            channel_embeddings = PositionalEncoding(
+                max_len=chan_seq_len,
+                emb_size=emb_size,
+                drop_rate=pe_droprate,
+            )(channel_embeddings)
+
+
     
-    chan_tokens = PositionalEncoding(
-        max_len=chan_seq_len,
-        emb_size=emb_size,
-        drop_rate=pe_droprate,
-    )(chan_tokens)
+
 
     # 3. Temporal Transformer self-attention (B, T, D)?
-    time_embeddings = TransformerEncoder(
-        time_tokens,
-        emb_size=emb_size,
-        num_layers=time_num_layers,
-        num_heads=time_num_heads,
-        att_drop=time_att_droprate,
-    ) 
+    if time_embeddings is not None:
+        time_embeddings = TransformerEncoder(
+            time_embeddings,
+            emb_size=emb_size,
+            num_layers=time_num_layers,
+            num_heads=time_num_heads,
+            att_drop=time_att_droprate,
+        ) 
     
     # 4. Channel Transformer self-attention (B, C, D)?
-    channel_embeddings = TransformerEncoder(
-        chan_tokens,
-        emb_size=emb_size,
-        num_layers=chan_num_layers,
-        num_heads=chan_num_heads,
-        att_drop=chan_att_droprate,
-    )
+    if channel_embeddings is not None:
+        channel_embeddings = TransformerEncoder(
+            channel_embeddings,
+            emb_size=emb_size,
+            num_layers=chan_num_layers,
+            num_heads=chan_num_heads,
+            att_drop=chan_att_droprate,
+        )
 
     # 5. Cross-Attention fusion of Channel/Temporal embeddings
     # PRE-LN 
     #time_embeddings = LayerNormalization()(time_embeddings)
-    time_fused = MultiHeadAttention(
-        num_heads=cross_time_num_heads,
-        key_dim=emb_size // cross_time_num_heads,
-        dropout=cross_time_att_droprate
-    )(
-        query=time_embeddings,
-        key=channel_embeddings,
-        value=channel_embeddings
-    )
-    time_embeddings = Add()([time_embeddings, time_fused])
-    time_embeddings = LayerNormalization()(time_embeddings)
 
-    channel_fused = MultiHeadAttention(
-        num_heads=cross_chan_num_heads,
-        key_dim=emb_size // cross_chan_num_heads, 
-        dropout=cross_chan_att_droprate,
-    )(
-        query=channel_embeddings, 
-        key=time_embeddings,
-        value=time_embeddings
-    )
+    if use_cross_attention and time_embeddings is not None and channel_embeddings is not None:
+        if use_cross_time_attention:
+            time_fused = MultiHeadAttention(
+                num_heads=cross_time_num_heads,
+                key_dim=emb_size // cross_time_num_heads,
+                dropout=cross_time_att_droprate
+            )(
+                query=time_embeddings,
+                key=channel_embeddings,
+                value=channel_embeddings
+            )
+            time_embeddings = Add()([time_embeddings, time_fused])
+            time_embeddings = LayerNormalization()(time_embeddings)
+        if use_cross_channel_attention: 
+            channel_fused = MultiHeadAttention(
+                num_heads=cross_chan_num_heads,
+                key_dim=emb_size // cross_chan_num_heads, 
+                dropout=cross_chan_att_droprate,
+            )(
+                query=channel_embeddings, 
+                key=time_embeddings,
+                value=time_embeddings
+            )
 
-    channel_embeddings = Add()([channel_embeddings, channel_fused])
-    channel_embeddings = LayerNormalization()(channel_embeddings)
+            channel_embeddings = Add()([channel_embeddings, channel_fused])
+            channel_embeddings = LayerNormalization()(channel_embeddings)
 
-    # 6. Cross-Attention pooling 
+    # 6. Cross-Attention pooling (3 strategies available)
+    fusion_list = []
 
-    # We use the average and max to try to capture (presence + saliency)
-    # for both temporal and spatial channel embeddings
-    time_avg = GlobalAveragePooling1D()(time_embeddings)
-    time_max = GlobalMaxPooling1D()(time_embeddings)
+    if fusion_mode in ["flatten", "gap+flatten"]:
+        if time_embeddings is not None:
+            fusion_list.append(Flatten()(time_embeddings))
+        if channel_embeddings is not None:
+            fusion_list.append(Flatten()(channel_embeddings))
 
-    chan_avg = GlobalAveragePooling1D()(channel_embeddings)
-    chan_max = GlobalAveragePooling1D()(channel_embeddings)
+    if fusion_mode in ["gap", "gap+flatten"]:
+        # We use the average and max to try to capture (presence + saliency)
+        # for both temporal and spatial channel embeddings
+        if time_embeddings is not None:
+            fusion_list.append(GlobalAveragePooling1D()(time_embeddings))
+            fusion_list.append(GlobalMaxPooling1D()(time_embeddings))
+        if channel_embeddings is not None:
+            fusion_list.append(GlobalAveragePooling1D()(channel_embeddings))
+            fusion_list.append(GlobalMaxPooling1D()(channel_embeddings))
 
-    x = Concatenate()([time_avg, time_max, chan_avg, chan_max])
-    # Apply a big droprate
+    x = Concatenate()(fusion_list)
     x = Dropout(pool_droprate)(x)
 
     # 7. Classification head (Returns logits)
