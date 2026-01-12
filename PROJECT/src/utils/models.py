@@ -719,10 +719,13 @@ def MultiScalePatchEmbedding(
     Chans,
     kernel_sizes=(5, 12, 25, 64, 125),
     filters_per_scale=(8, 16, 16, 16, 4),
-    pool_size=8,
+    channel_temp_filter_size=4,
+    pool_size=4,
     final_dropout=0.3,
     spatial_dropout=0.1,
+    emb_size=40,
 ):
+    # 1) MULTI-SCALE TEMPORAL CONVOLUTIONS (frequency-aware filters)
     branches = []
     for k, f in zip(kernel_sizes, filters_per_scale):
         b = Conv2D(f, (1, k), padding="same", use_bias=False)(x)
@@ -730,34 +733,87 @@ def MultiScalePatchEmbedding(
         b = Activation("elu")(b)
         branches.append(b)
 
-    # (B, Chans, T, F_total)
+    # Concatenate all temporal scales
+    # Shape: (B, Chans, Samples, F_total)
     x = Concatenate(axis=-1)(branches)
+    F_total = x.shape[-1]
 
-    # CHANNEL TOKENS (PRE-SPATIAL-COLLAPSE (MIXING OF ELECTRODES)) 
-    # Average over time → each electrode has rich spectral features
-    chan_tokens = tf.reduce_mean(x, axis=2)          # (B, Chans, F_total)
-    chan_tokens = Dense(x.shape[-1], use_bias=False)(chan_tokens)
+    print("Time Tokens After temporal convolution: {}", x.shape)
 
-    # TEMPORAL TOKENS
-    x = Conv2D(
-        x.shape[-1],
-        (Chans, 1),
-        padding="valid",
+    # ------------------------------------------------------------------
+    # 2) CHANNEL TOKENS (electrode-wise tokens)
+    # ------------------------------------------------------------------
+    # Now we are going to convolve and aggregate time so (B, C, X) and then 
+    # with a final linear layer we down-project X -> emb_size
+    chan_tokens = Conv2D(
+        filters=F_total,
+        kernel_size=(1, channel_temp_filter_size),
+        strides=(1,2),
+        padding="same",
         use_bias=False
     )(x)
+    chan_tokens = BatchNormalization()(chan_tokens)
+    chan_tokens = Activation("elu")(chan_tokens)
+    print("Channel tokens After FIRST CONVOLUTION: {}", chan_tokens.shape)
+
+    chan_tokens = Conv2D(
+        filters=F_total,
+        kernel_size=(1, channel_temp_filter_size),
+        strides=(1,2),
+        padding="same",
+        use_bias=False
+    )(chan_tokens)
+    chan_tokens = BatchNormalization()(chan_tokens)
+    chan_tokens = Activation("elu")(chan_tokens)
+    print("Channel tokens After SECOND CONVOLUTION: {}", chan_tokens.shape)
+    #
+    #  Flatten temporal + feature dimension: (B, C, X*F) for final projection
+    chan_tokens = Reshape((Chans, -1))(chan_tokens)
+    print("Channel tokens After flattening temporal + feature dims: {}", chan_tokens.shape)
+
+    # shape: (B, Chans, emb_size), followed by normalization, no need to use bias
+    # Analogous to ViT, add linear projection layer to avoid shape issues
+    # the shape of the token depends on the sum of filters per scale
+    chan_tokens = Dense(emb_size, use_bias=False)(chan_tokens)
+    print("Channel tokens After DENSE: {}", chan_tokens.shape)
+
+
+    # ------------------------------------------------------------------
+    # 3) TIME TOKENS (temporal patches after spatial mixing)
+    # ------------------------------------------------------------------
+    x = Conv2D(
+        filters=F_total,
+        kernel_size=(Chans, 1),
+        padding="valid",
+        use_bias=False,
+    )(x)                                    
+
+    print("Time tokens After channel convolution: {}", x.shape)
+
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
     x = SpatialDropout2D(spatial_dropout)(x)
 
     x = AveragePooling2D((1, pool_size))(x)
     x = Dropout(final_dropout)(x)
+    print("Time tokens After pooling and dropout: {}", x.shape)
 
-    # (B, T, F_total)
-    B = tf.shape(x)[0]
-    T = tf.shape(x)[2]
-    D = tf.shape(x)[3]
-    time_tokens = tf.reshape(x, (B, T, D))
 
+    # ------------------------------------------------------------------
+    # 4) Reshape → Transformer tokens
+    # ------------------------------------------------------------------
+    time_tokens = Reshape(
+        (-1, F_total),
+        name="time_token_reshape",
+    )(x)
+
+    time_tokens = Dense(
+        emb_size,
+        use_bias=False,
+        name="time_projection",
+    )(time_tokens)
+
+    print("Time tokens After DENSE: {}", time_tokens.shape)
     return time_tokens, chan_tokens
 
 
@@ -785,6 +841,7 @@ def DualAttentionEEGConformer(
     patch_spatial_droprate=0.3,
     patch_final_droprate=0.1,
     patch_pool_size=8,
+    patch_channel_temp_filter_size=4,
     # Positional encoding 
     pe_droprate=0.1,
     # Self-Attention Transformers
@@ -806,57 +863,41 @@ def DualAttentionEEGConformer(
     classif_droprate_probs=(0.4, 0.2),    
 ) -> Model:
 
-    # 0. Raw EEG signal, NumChannels * Time samples
+    # 0. Raw EEG signal: (Batch B, Channels C, TimeSamples T, 1) (convolution channel)
     inp = Input((Chans, Samples, 1))
 
+    # Its better for the embedding representation (Bottleneck effect autoencoder)
+    assert(sum(patch_filters_per_scale) >= emb_size)
+
     # 1. Multi-scale CNN Patch Tokens
-    time_tokens = MultiScalePatchEmbedding(
+    time_tokens, chan_tokens = MultiScalePatchEmbedding(
         inp, Chans, 
-        patch_kernel_sizes,
-        patch_filters_per_scale,
-        patch_pool_size,
-        patch_spatial_droprate,
-        patch_final_droprate,
+        kernel_sizes=patch_kernel_sizes,
+        filters_per_scale=patch_filters_per_scale,
+        pool_size=patch_pool_size,
+        spatial_dropout=patch_spatial_droprate,
+        final_dropout=patch_final_droprate,
+        channel_temp_filter_size=patch_channel_temp_filter_size,
+        emb_size=emb_size
     )
-    # Maybe an assertion of sum of filters >= embedding size could be useful here
-    #assert(sum(patch_filters_per_scale) >= emb_size)
-
-    # Analogous to ViT, add linear projection layer to avoid shape issues
-    # the shape of the token depends on the sum of filters per scale
-
-    time_tokens = Dense(emb_size, use_bias=False)(time_tokens)
-    # Scale embeddings (standard transformer trick)
-    time_tokens = time_tokens * tf.math.sqrt(tf.cast(emb_size, tf.float32))
 
     # 2. Add Positional encoding to patch embeddings 
     time_seq_len = time_tokens.shape[1]  
-    
+    chan_seq_len = chan_tokens.shape[1]  
+
     time_tokens = PositionalEncoding(
-        seq_len=time_seq_len,
+        max_len=time_seq_len,
         emb_size=emb_size,
         drop_rate=pe_droprate,
     )(time_tokens)
-
-
-    # TODO: This is too simplistic change it
-    # 3. Channel tokens (average over time + linear projection)
-    chan_tokens = tf.reduce_mean(inp, axis=2)  # (B, Chans, 1)
-    chan_tokens = Dense(emb_size)(chan_tokens)  # (B, Chans, emb_size)
-
-    chan_seq_len = chan_tokens.shape[1]  
     
     chan_tokens = PositionalEncoding(
-        seq_len=chan_seq_len,
+        max_len=chan_seq_len,
         emb_size=emb_size,
         drop_rate=pe_droprate,
     )(chan_tokens)
 
-    # TODO: Check the shapes of embeddings and tokens they are mismatched right now
-    # what is the size of the tokens?????? depends on the number of kernels right? 
-    # here some pooling or dense layer should be added to perform dimensionality reduction 
-
-
-    # 3. Temporal Transformer self-attention (B, T, D)
+    # 3. Temporal Transformer self-attention (B, T, D)?
     time_embeddings = TransformerEncoder(
         time_tokens,
         emb_size=emb_size,
@@ -865,7 +906,7 @@ def DualAttentionEEGConformer(
         att_drop=time_att_droprate,
     ) 
     
-    # 4. Channel Transformer self-attention 
+    # 4. Channel Transformer self-attention (B, C, D)?
     channel_embeddings = TransformerEncoder(
         chan_tokens,
         emb_size=emb_size,
@@ -893,6 +934,10 @@ def DualAttentionEEGConformer(
         num_heads=cross_chan_num_heads,
         key_dim=emb_size // cross_chan_num_heads, 
         dropout=cross_chan_att_droprate,
+    )(
+        query=channel_embeddings, 
+        key=time_embeddings,
+        value=time_embeddings
     )
 
     channel_embeddings = Add()([channel_embeddings, channel_fused])
