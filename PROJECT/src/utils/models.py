@@ -399,7 +399,7 @@ def PatchEmbedding(
     x = Dropout(drop_prob)(x)
     # 1x1 projection
     x = Conv2D(n_filters_time, (1, 1), padding="same")(x)
-    # (B, D, 1, T) → (B, T, D)
+    # (B, D, 1, T) -> (B, T, D)
     x = Reshape((-1, n_filters_time))(x)
     return x
 
@@ -740,7 +740,7 @@ def MultiScalePatchEmbedding(
     # Shape: (B, Chans, Samples, F_total)
     x = Concatenate(axis=-1)(branches)
 
-    print("Time Tokens After temporal convolution: {}", x.shape)
+    #print("Time Tokens After temporal convolution: {}", x.shape)
 
     # ------------------------------------------------------------------
     # 2) CHANNEL TOKENS (electrode-wise tokens)
@@ -756,17 +756,17 @@ def MultiScalePatchEmbedding(
     )(x)
     channel_embeddings = BatchNormalization()(channel_embeddings)
     channel_embeddings = Activation("elu")(channel_embeddings)
-    print("Channel tokens After CONVOLUTION: {}", channel_embeddings.shape)
+    #print("Channel tokens After CONVOLUTION: {}", channel_embeddings.shape)
     #
     #  Flatten temporal + feature dimension: (B, C, X*F) for final projection
     channel_embeddings = Reshape((Chans, -1))(channel_embeddings)
-    print("Channel tokens After flattening temporal + feature dims: {}", channel_embeddings.shape)
+    #print("Channel tokens After flattening temporal + feature dims: {}", channel_embeddings.shape)
 
     # shape: (B, Chans, emb_size), followed by normalization, no need to use bias
     # Analogous to ViT, add linear projection layer to avoid shape issues
     # the shape of the token depends on the sum of filters per scale
     channel_embeddings = Dense(emb_size, use_bias=False)(channel_embeddings)
-    print("Channel tokens After DENSE: {}", channel_embeddings.shape)
+    #print("Channel tokens After DENSE: {}", channel_embeddings.shape)
 
 
     # ------------------------------------------------------------------
@@ -779,7 +779,7 @@ def MultiScalePatchEmbedding(
         use_bias=False,
     )(x)                                    
 
-    print("Time tokens After channel convolution: {}", x.shape)
+    #print("Time tokens After channel convolution: {}", x.shape)
 
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
@@ -787,11 +787,11 @@ def MultiScalePatchEmbedding(
 
     x = AveragePooling2D((1, pool_size))(x)
     x = Dropout(final_dropout)(x)
-    print("Time tokens After pooling and dropout: {}", x.shape)
+    #print("Time tokens After pooling and dropout: {}", x.shape)
 
 
     # ------------------------------------------------------------------
-    # 4) Reshape → Transformer tokens
+    # 4) Reshape -> Transformer tokens
     # ------------------------------------------------------------------
     time_embeddings = Reshape(
         (-1, F_total),
@@ -804,10 +804,63 @@ def MultiScalePatchEmbedding(
         name="time_projection",
     )(time_embeddings)
 
-    print("Time tokens After DENSE: {}", time_embeddings.shape)
+    #print("Time tokens After DENSE: {}", time_embeddings.shape)
     return time_embeddings, channel_embeddings
 
 
+
+def DualAxisTransformerBlock(
+    time_embeddings,
+    channel_embeddings,
+    emb_size,
+    num_heads,
+    dropout,
+    use_cross_time_attention=True,
+    use_cross_channel_attention=True,
+):
+    """
+    One block: self-attention on both streams, then cross-attention fusion
+    """
+    # Self-attention on both streams
+    time_self = TransformerEncoderBlock(
+        time_embeddings,
+        emb_size=emb_size,
+        num_heads=num_heads,
+        drop_prob=dropout,
+    )
+    
+    channel_self = TransformerEncoderBlock(
+        channel_embeddings,
+        emb_size=emb_size,
+        num_heads=num_heads,
+        drop_prob=dropout,
+    )
+    
+    # Cross-attention: time -> channel
+    if use_cross_time_attention:
+        time_cross = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=emb_size // num_heads,
+            dropout=dropout
+        )(query=time_self, key=channel_self, value=channel_self)
+        time_out = Add()([time_self, Dropout(dropout)(time_cross)])
+        time_out = LayerNormalization(epsilon=1e-6)(time_out)
+    else:
+        time_out = time_self
+    
+    # Cross-attention: channel -> time
+    if use_cross_channel_attention:
+        channel_cross = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=emb_size // num_heads,
+            dropout=dropout
+        )(query=channel_self, key=time_out, value=time_out)
+        channel_out = Add()([channel_self, Dropout(dropout)(channel_cross)])
+        channel_out = LayerNormalization(epsilon=1e-6)(channel_out)
+    else:
+        channel_out = channel_self
+    
+    return time_out, channel_out
 
 # The proposed Dual-Axis EEG Conformer explicitly models both temporal and channel-wise dependencies via axis-aware self-attention
 # followed by cross-attention fusion, leading to improved representational capacity over CTNet
@@ -818,14 +871,14 @@ def MultiScalePatchEmbedding(
 # 4) Cross attention fusion of the 2 Temporal/Channel encodings to allow capturing attention in channels too
 # 5) Improve pooling mechanisms (learnable pooling + global pooling at the end)
 
-def DualAttentionEEGConformer(
+def MultiScaleDualAxisConformer(
     # Basic
     nb_classes,
     Chans=64,
     Samples=256,
     emb_size=40,
     # CNN Patches 
-    patch_kernel_sizes=(5, 12, 25, 64 ,125),
+    patch_kernel_sizes=(5, 12, 25, 64, 125),
     patch_filters_per_scale=(8, 16, 16, 16, 4),
     patch_spatial_droprate=0.3,
     patch_final_droprate=0.1,
@@ -833,42 +886,35 @@ def DualAttentionEEGConformer(
     patch_channel_temp_filter_size=4,
     # Positional encoding 
     pe_droprate=0.1,
-    # Self-Attention Transformers
-    time_num_heads=8,
-    chan_num_heads=8,
-    time_num_layers=4,
-    chan_num_layers=4,
-    time_att_droprate=0.1,
-    chan_att_droprate=0.1,
-    # Cross-Attention Transformer 
-    cross_time_num_heads=8,
-    cross_time_att_droprate=0.1,
-    cross_chan_num_heads=8,
-    cross_chan_att_droprate=0.1,
+    # Transformer Architecture
+    att_num_layers=4,              # Number of dual-axis transformer blocks
+    att_num_heads=8,               # Attention heads (used for both self and cross)
+    att_dropout=0.1,           # Dropout for all attention layers
     # Final Pooling
     pool_droprate=0.4,
-    # Classification Head & Pooling
+    # Classification Head
     classif_hidden_units=(128, 32),
     classif_droprate_probs=(0.4, 0.2),   
     # Ablation flags
     use_time_embeddings=True, 
     use_channel_embeddings=True, 
     use_cross_attention=True,
-    use_cross_channel_attention=True,
-    use_cross_time_attention=True,
+    use_cross_time_attention=True,      # Time attends to Channel
+    use_cross_channel_attention=True,   # Channel attends to Time
     use_positional_encoding=True, 
-    fusion_mode="gap+flatten", #options: flatten, gap, gap+flatten
+    fusion_mode="gap+flatten",          # Options: "flatten", "gap", "gap+flatten"
 ) -> Model:
 
-    # 0. Raw EEG signal: (Batch B, Channels C, TimeSamples T, 1) (convolution channel)
+    # 0. Raw EEG signal: (Batch B, Channels C, TimeSamples T, 1)
     inp = Input((Chans, Samples, 1))
 
-    # Its better for the embedding representation (Bottleneck effect autoencoder)
-    assert sum(patch_filters_per_scale) >= emb_size, "The sum of filters must be greater than the embedding size to produce a bottleneck!"
+    # Validation
+    assert sum(patch_filters_per_scale) >= emb_size, \
+        "Sum of filters must be >= emb_size for bottleneck!"
     assert Samples % patch_pool_size == 0, \
         f"Samples ({Samples}) must be divisible by patch_pool_size ({patch_pool_size})"
-    expected_time_seq_len = Samples // patch_pool_size
-    assert expected_time_seq_len > 0, "Time sequence length would be 0 after pooling"
+    assert Samples // patch_pool_size > 0, \
+        "Time sequence length would be 0 after pooling"
 
     # 1. Multi-scale CNN Patch Tokens
     time_embeddings, channel_embeddings = MultiScalePatchEmbedding(
@@ -888,7 +934,7 @@ def DualAttentionEEGConformer(
     if not use_channel_embeddings: 
         channel_embeddings = None
 
-    # 2. Add Positional encoding to patch embeddings 
+    # 2. Positional Encoding
     if use_positional_encoding:
         if time_embeddings is not None:
             time_seq_len = time_embeddings.shape[1]  
@@ -905,62 +951,40 @@ def DualAttentionEEGConformer(
                 drop_rate=pe_droprate,
             )(channel_embeddings)
 
-
-    
-
-
-    # 3. Temporal Transformer self-attention (B, T, D)?
-    if time_embeddings is not None:
-        time_embeddings = TransformerEncoder(
-            time_embeddings,
-            emb_size=emb_size,
-            num_layers=time_num_layers,
-            num_heads=time_num_heads,
-            att_drop=time_att_droprate,
-        ) 
-    
-    # 4. Channel Transformer self-attention (B, C, D)?
-    if channel_embeddings is not None:
-        channel_embeddings = TransformerEncoder(
-            channel_embeddings,
-            emb_size=emb_size,
-            num_layers=chan_num_layers,
-            num_heads=chan_num_heads,
-            att_drop=chan_att_droprate,
-        )
-
-    # 5. Cross-Attention fusion of Channel/Temporal embeddings
-    # PRE-LN 
-    #time_embeddings = LayerNormalization()(time_embeddings)
-
+    # 3. Dual-Axis Transformer
     if use_cross_attention and time_embeddings is not None and channel_embeddings is not None:
-        if use_cross_time_attention:
-            time_fused = MultiHeadAttention(
-                num_heads=cross_time_num_heads,
-                key_dim=emb_size // cross_time_num_heads,
-                dropout=cross_time_att_droprate
-            )(
-                query=time_embeddings,
-                key=channel_embeddings,
-                value=channel_embeddings
+        # Interleaved self-attention + cross-attention
+        for layer_idx in range(att_num_layers):
+            time_embeddings, channel_embeddings = DualAxisTransformerBlock(
+                time_embeddings=time_embeddings,
+                channel_embeddings=channel_embeddings,
+                emb_size=emb_size,
+                num_heads=att_num_heads,
+                dropout=att_dropout,
+                use_cross_time_attention=use_cross_time_attention,
+                use_cross_channel_attention=use_cross_channel_attention,
             )
-            time_embeddings = Add()([time_embeddings, time_fused])
-            time_embeddings = LayerNormalization()(time_embeddings)
-        if use_cross_channel_attention: 
-            channel_fused = MultiHeadAttention(
-                num_heads=cross_chan_num_heads,
-                key_dim=emb_size // cross_chan_num_heads, 
-                dropout=cross_chan_att_droprate,
-            )(
-                query=channel_embeddings, 
-                key=time_embeddings,
-                value=time_embeddings
+    else:
+        # Fallback: Independent self-attention only
+        if time_embeddings is not None:
+            time_embeddings = TransformerEncoder(
+                time_embeddings,
+                emb_size=emb_size,
+                num_layers=att_num_layers,
+                num_heads=att_num_heads,
+                att_drop=att_dropout,
+            )
+        
+        if channel_embeddings is not None:
+            channel_embeddings = TransformerEncoder(
+                channel_embeddings,
+                emb_size=emb_size,
+                num_layers=att_num_layers,
+                num_heads=att_num_heads,
+                att_drop=att_dropout,
             )
 
-            channel_embeddings = Add()([channel_embeddings, channel_fused])
-            channel_embeddings = LayerNormalization()(channel_embeddings)
-
-    # 6. Cross-Attention pooling (3 strategies available)
+    # 4. Pooling & Fusion
     fusion_list = []
 
     if fusion_mode in ["flatten", "gap+flatten"]:
@@ -970,8 +994,6 @@ def DualAttentionEEGConformer(
             fusion_list.append(Flatten()(channel_embeddings))
 
     if fusion_mode in ["gap", "gap+flatten"]:
-        # We use the average and max to try to capture (presence + saliency)
-        # for both temporal and spatial channel embeddings
         if time_embeddings is not None:
             fusion_list.append(GlobalAveragePooling1D()(time_embeddings))
             fusion_list.append(GlobalMaxPooling1D()(time_embeddings))
@@ -982,7 +1004,7 @@ def DualAttentionEEGConformer(
     x = Concatenate()(fusion_list)
     x = Dropout(pool_droprate)(x)
 
-    # 7. Classification head (Returns logits)
+    # 5. Classification Head
     out = ClassificationHead(
         x,
         nb_classes=nb_classes,
