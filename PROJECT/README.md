@@ -1,4 +1,4 @@
-# Thought in Motion: A State-of-the-Art Survey on Motor Imagery Decoding from EEG
+# Read My Mind: EEG Motor Imagery Decoding with the Multi-Scale Dual-Axis Conformer
 
 <h1 align="center">
 <img src="resources/EEG_example.png" width="512">
@@ -6,6 +6,8 @@
 
 
 ## Description
+
+TODO: Change all this readme with the summary of the paper :) 
 
 This project analyzes over 5 GB of EEG data to develop a robust classifier for Motor Imagery (MI). Our goal is threefold: to provide the user with a practical insight on the latest trends, techniques and surveys related to the modelling, preprocessing, and representation of EEG data, to build a high-accuracy predictive model for Brain-Computer Interfaces (BCI), and to serve as a practical tutorial and best-practice guide for handling complex neurophysiological data.
 
